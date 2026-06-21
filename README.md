@@ -63,6 +63,32 @@ redelivers it after the visibility timeout (at-least-once). The poll loop never 
 a bad message — observe via `onError` / `onUnknownUrn`. The envelope is unchanged
 (`schema_version` stays `1`); SQS is purely additive.
 
+## Trace propagation (OpenTelemetry `traceparent`, ADR-0028)
+
+The optional core `com.babelqueue.otel` module can carry a W3C `traceparent` so a
+consumer span becomes a true child of the producer span — propagated **out of band** on
+the SQS `MessageAttributes` channel, beside the contract `bq-*` attributes (a contract
+attribute always wins a key collision; bounded by the SQS 10-attribute cap), never inside
+the frozen envelope (GR-1).
+
+```java
+// produce: HeaderSender -> SqsPublisher.publishWithHeaders
+SqsPublisher publisher = SqsPublisher.create(sqs, url);
+Tracing.publish(tracer, "urn:babel:orders:created", Map.of("order_id", 1042), "orders",
+    (envelope, headers) -> publisher.publishWithHeaders(envelope, headers));
+
+// consume: surface the delivered attributes for wrapHandler's Supplier
+SqsConsumer.builder(sqs, url)
+    .handler("urn:babel:orders:created", (env, message) ->
+        Tracing.wrapHandler(tracer, h, () -> SqsHeaders.of(message)).handle(env))
+    .build();
+```
+
+A header-less `publish(...)` is byte-identical to before; with no `traceparent` the
+consumer falls back to the v0.1 `trace_id`-derived parent. Requires `babelqueue-core`
+≥ 1.5.0. No OpenTelemetry dependency is needed unless you opt in — the seam is a plain
+`Map<String,String>`.
+
 ## Build & test
 
 ```bash
