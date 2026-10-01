@@ -4,32 +4,52 @@ import com.babelqueue.BabelQueueException;
 import com.babelqueue.Envelope;
 import com.babelqueue.EnvelopeCodec;
 import com.babelqueue.UnknownUrnException;
+import com.babelqueue.UnknownUrnStrategy;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
 import java.util.function.BooleanSupplier;
 import software.amazon.awssdk.services.sqs.SqsClient;
+import software.amazon.awssdk.services.sqs.model.ChangeMessageVisibilityRequest;
 import software.amazon.awssdk.services.sqs.model.DeleteMessageRequest;
 import software.amazon.awssdk.services.sqs.model.Message;
 import software.amazon.awssdk.services.sqs.model.ReceiveMessageRequest;
 
 /**
  * Polls an SQS queue, decodes and validates each message, routes it to the handler
- * registered for its URN, and deletes it on success. A throwing handler leaves the
- * message undeleted — SQS redelivers it after the visibility timeout (at-least-once);
- * {@code attempts} is reconciled to {@code ApproximateReceiveCount - 1} for the handler.
- * The poll loop never stops on a bad message — observe via {@code onError}/{@code onUnknownUrn}.
+ * registered for its URN, and deletes it on success. A throwing handler's message is
+ * <em>released</em>, never deleted: per broker-bindings.md §3 the consumer calls
+ * {@code ChangeMessageVisibility(ReceiptHandle, VisibilityTimeout = releaseDelaySeconds)}
+ * ({@code 0} = redeliver now (default), {@code N} = backoff N seconds, clamped to 12 h) and SQS
+ * redelivers it (at-least-once). {@code attempts} is reconciled to
+ * {@code ApproximateReceiveCount - 1} for the handler; SQS owns the counter.
+ *
+ * <p>A URN with no handler follows the {@link UnknownUrnStrategy unknown-URN strategy}:
+ * {@code fail} reports {@link UnknownUrnException} and leaves the message (visibility expiry
+ * redelivers it); {@code delete} deletes it; {@code release} releases it with
+ * {@code unknownUrnReleaseDelaySeconds} (default {@code 0}); {@code dead_letter} degrades to {@code delete}
+ * because this transport has no DLQ publisher (the contract's "DLQ disabled" rule).
+ * The poll loop never stops on a bad message, a failed release or a failed delete — observe via
+ * {@code onError}/{@code onUnknownUrn}. Configure a queue {@code RedrivePolicy} so a poison
+ * message, redelivered immediately under the default {@code 0} delay, ends in a native DLQ.
  */
 public final class SqsConsumer {
 
-    /** Notified of a non-conformant envelope, an unmapped URN (no {@code onUnknownUrn}), or a throwing handler. */
+    /**
+     * Notified of a non-conformant envelope, an unmapped URN (no {@code onUnknownUrn}), a throwing
+     * handler, a failed release ({@code ChangeMessageVisibility} error), or a failed delete of a
+     * processed message (reported as {@link SqsDeleteException}; the message is not released).
+     */
     @FunctionalInterface
     public interface ErrorHandler {
         void onError(Throwable error, Envelope envelope, Message message);
     }
 
-    /** Called instead of erroring when a URN has no handler; the message is then deleted. */
+    /**
+     * Called when a URN has no handler, before the unknown-URN strategy is applied. Setting
+     * it without an explicit strategy keeps the pre-1.2.0 behaviour: the message is deleted.
+     */
     @FunctionalInterface
     public interface UnknownUrnHandler {
         void onUnknownUrn(Envelope envelope, Message message);
@@ -43,6 +63,12 @@ public final class SqsConsumer {
     private final int maxMessages;
     private final ErrorHandler onError;
     private final UnknownUrnHandler onUnknownUrn;
+    private final String unknownUrnStrategy;
+    private final int releaseDelaySeconds;
+    private final int unknownUrnReleaseDelaySeconds;
+
+    /** The SQS maximum for {@code VisibilityTimeout}: 12 hours, in seconds. */
+    public static final int MAX_VISIBILITY_TIMEOUT_SECONDS = 43_200;
 
     private SqsConsumer(Builder builder) {
         this.client = builder.client;
@@ -53,6 +79,11 @@ public final class SqsConsumer {
         this.maxMessages = builder.maxMessages;
         this.onError = builder.onError;
         this.onUnknownUrn = builder.onUnknownUrn;
+        this.unknownUrnStrategy = builder.unknownUrnStrategy != null
+            ? builder.unknownUrnStrategy
+            : (builder.onUnknownUrn != null ? UnknownUrnStrategy.DELETE : UnknownUrnStrategy.FAIL);
+        this.releaseDelaySeconds = builder.releaseDelaySeconds;
+        this.unknownUrnReleaseDelaySeconds = builder.unknownUrnReleaseDelaySeconds;
     }
 
     public static Builder builder(SqsClient client, String queueUrl) {
@@ -104,21 +135,37 @@ public final class SqsConsumer {
         String urn = EnvelopeCodec.urn(envelope);
         BabelHandler handler = handlers.get(urn);
         if (handler == null) {
-            if (onUnknownUrn != null) {
-                onUnknownUrn.onUnknownUrn(envelope, message);
-                delete(message);
-            } else {
-                report(new UnknownUrnException(urn), envelope, message);
-            }
+            handleUnknownUrn(urn, envelope, message);
             return;
         }
 
         try {
             handler.handle(envelope, message);
-            delete(message);
         } catch (Exception error) {
-            // Leave the message undeleted — SQS redelivers after the visibility timeout.
+            // Never delete on failure: report first, then release with the backoff so SQS
+            // redelivers it. A failed release is reported too and never escapes the poll loop.
             report(error, envelope, message);
+            release(message, releaseDelaySeconds, envelope);
+            return;
+        }
+        // Outside the handler's try: a failed delete is not a handler failure, so it is
+        // reported as SqsDeleteException and the message is never released.
+        delete(message, envelope);
+    }
+
+    private void handleUnknownUrn(String urn, Envelope envelope, Message message) {
+        if (onUnknownUrn != null) {
+            onUnknownUrn.onUnknownUrn(envelope, message);
+        }
+        switch (unknownUrnStrategy) {
+            case UnknownUrnStrategy.DELETE, UnknownUrnStrategy.DEAD_LETTER -> delete(message, envelope);
+            case UnknownUrnStrategy.RELEASE -> release(message, unknownUrnReleaseDelaySeconds, envelope);
+            default -> {
+                // fail: leave the message; visibility expiry redelivers it, native redrive quarantines it.
+                if (onUnknownUrn == null) {
+                    report(new UnknownUrnException(urn), envelope, message);
+                }
+            }
         }
     }
 
@@ -144,19 +191,49 @@ public final class SqsConsumer {
         if (reconciled <= envelope.attempts()) {
             return envelope;
         }
-        return new Envelope(
-            envelope.job(), envelope.traceId(), envelope.data(), envelope.meta(),
-            reconciled, envelope.deadLetter());
+        // withAttempts keeps every other component, including unknown top-level/meta keys.
+        return envelope.withAttempts(reconciled);
     }
 
-    private void delete(Message message) {
+    /**
+     * Release (retry): {@code ChangeMessageVisibility(ReceiptHandle, delaySeconds)} — never a delete.
+     * A broker error (stale receipt handle, throttling, network) is reported via {@code onError}
+     * and swallowed: the message is still redelivered once its visibility timeout expires, and
+     * the poll loop keeps running.
+     */
+    private void release(Message message, int delaySeconds, Envelope envelope) {
         if (message.receiptHandle() == null) {
             return;
         }
-        client.deleteMessage(DeleteMessageRequest.builder()
-            .queueUrl(queueUrl)
-            .receiptHandle(message.receiptHandle())
-            .build());
+        try {
+            client.changeMessageVisibility(ChangeMessageVisibilityRequest.builder()
+                .queueUrl(queueUrl)
+                .receiptHandle(message.receiptHandle())
+                .visibilityTimeout(delaySeconds)
+                .build());
+        } catch (RuntimeException releaseError) {
+            report(releaseError, envelope, message);
+        }
+    }
+
+    /**
+     * Acknowledge a processed message with {@code DeleteMessage}. A broker error (throttling,
+     * network, stale receipt handle) is reported via {@code onError} as an
+     * {@link SqsDeleteException} and swallowed — no release, so the message comes back only
+     * after its visibility timeout — and the poll loop keeps running.
+     */
+    private void delete(Message message, Envelope envelope) {
+        if (message.receiptHandle() == null) {
+            return;
+        }
+        try {
+            client.deleteMessage(DeleteMessageRequest.builder()
+                .queueUrl(queueUrl)
+                .receiptHandle(message.receiptHandle())
+                .build());
+        } catch (RuntimeException deleteError) {
+            report(new SqsDeleteException(deleteError), envelope, message);
+        }
     }
 
     private void report(Throwable error, Envelope envelope, Message message) {
@@ -175,6 +252,9 @@ public final class SqsConsumer {
         private int maxMessages = 10;
         private ErrorHandler onError;
         private UnknownUrnHandler onUnknownUrn;
+        private String unknownUrnStrategy;
+        private int releaseDelaySeconds;
+        private int unknownUrnReleaseDelaySeconds;
 
         private Builder(SqsClient client, String queueUrl) {
             this.client = Objects.requireNonNull(client, "client");
@@ -218,6 +298,53 @@ public final class SqsConsumer {
         public Builder onUnknownUrn(UnknownUrnHandler handler) {
             this.onUnknownUrn = handler;
             return this;
+        }
+
+        /**
+         * Backoff (seconds) applied when a handler throws: the message is released via
+         * {@code ChangeMessageVisibility} with this {@code VisibilityTimeout}. Default {@code 0}
+         * (redeliver now). Out-of-range values are clamped to 0–43200 (the SQS 12 h cap), like
+         * the Go and Python transports.
+         *
+         * <p>With the default {@code 0} a permanently failing (poison) message is redelivered
+         * immediately on every receive; configure a {@code RedrivePolicy}
+         * ({@code maxReceiveCount}) on the queue so SQS moves it to a native DLQ, and/or set a
+         * non-zero delay here.
+         */
+        public Builder releaseDelaySeconds(int seconds) {
+            this.releaseDelaySeconds = clampDelay(seconds);
+            return this;
+        }
+
+        /**
+         * Unknown-URN strategy: one of {@link UnknownUrnStrategy#FAIL}, {@link UnknownUrnStrategy#DELETE},
+         * {@link UnknownUrnStrategy#RELEASE} or {@link UnknownUrnStrategy#DEAD_LETTER} (degrades to
+         * {@code delete}: no DLQ publisher in this transport). Default: {@code fail}, or {@code delete}
+         * when only {@link #onUnknownUrn} is set (pre-1.2.0 behaviour).
+         */
+        public Builder unknownUrnStrategy(String strategy) {
+            Objects.requireNonNull(strategy, "strategy");
+            switch (strategy) {
+                case UnknownUrnStrategy.FAIL, UnknownUrnStrategy.DELETE,
+                    UnknownUrnStrategy.RELEASE, UnknownUrnStrategy.DEAD_LETTER -> this.unknownUrnStrategy = strategy;
+                default -> throw new IllegalArgumentException("Unknown unknown-URN strategy: " + strategy);
+            }
+            return this;
+        }
+
+        /**
+         * Backoff (seconds) for the {@code release} unknown-URN strategy. Default {@code 0}
+         * (redeliver now, matching the Python and Node transports); out-of-range values are
+         * clamped to 0–43200.
+         */
+        public Builder unknownUrnReleaseDelaySeconds(int seconds) {
+            this.unknownUrnReleaseDelaySeconds = clampDelay(seconds);
+            return this;
+        }
+
+        /** Clamp a delay to the SQS {@code VisibilityTimeout} range, 0–43200 s (Go/Python parity). */
+        private static int clampDelay(int seconds) {
+            return Math.max(0, Math.min(seconds, MAX_VISIBILITY_TIMEOUT_SECONDS));
         }
 
         public SqsConsumer build() {

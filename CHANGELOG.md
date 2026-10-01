@@ -9,6 +9,52 @@ The envelope wire format is versioned separately by `meta.schema_version`
 
 ## [Unreleased]
 
+## [1.2.0] - 2026-10-01
+
+MINOR release: the failure path's behaviour and the public `Builder` API change.
+
+### Changed
+- **Release now follows broker-bindings.md §3 — behaviour change.** A throwing handler's
+  message is always released with `ChangeMessageVisibility(ReceiptHandle, VisibilityTimeout =
+  backoff)` instead of being left to wait out the queue's full visibility timeout; it is still
+  never deleted. The backoff is the new `Builder.releaseDelaySeconds(int)`, **default `0` =
+  redeliver now**. Previously a failing message reappeared only after the visibility timeout
+  (e.g. 30 s). Set `releaseDelaySeconds(N)` to keep a delay between attempts.
+- **Poison-loop risk.** With the default `0`, a message that fails permanently is redelivered on
+  every receive, and a short outage can burn through `maxReceiveCount` in under a second.
+  **Configure a `RedrivePolicy` on the queue** (`deadLetterTargetArn` + `maxReceiveCount`) so SQS
+  moves such a message to a native DLQ, and pick a non-zero `releaseDelaySeconds` if the
+  handler depends on something that can be briefly unavailable.
+- Out-of-range delays are **clamped** to 0–43200 s (the SQS 12 h cap), like the Go and Python
+  transports; they no longer throw.
+- Require `com.babelqueue:babelqueue-core 1.8.0` (unknown-key preservation, `Envelope.withAttempts`).
+
+### Fixed
+- A failed `DeleteMessage` after a **successful** handler (throttling, network, stale receipt
+  handle) is no longer treated as a handler failure: it is reported to `onError` as the new
+  `SqsDeleteException` (broker error as its cause) and the message is **not** released, so it
+  is redelivered only after its visibility timeout instead of immediately. The same applies to
+  the `delete`/`dead_letter` unknown-URN strategies; a failed delete never escapes `poll()`.
+- A failed release (`ChangeMessageVisibility` rejected: stale receipt handle, throttling,
+  network) no longer escapes `poll()`/`run()`. The handler error is reported to `onError`
+  first, then the release error; the batch continues and SQS still redelivers the message
+  once its visibility timeout expires.
+- `attempts` reconciliation now preserves unknown top-level / `meta` keys (core 1.8.0 extras),
+  so a newer producer's additions reach the handler unchanged.
+
+### Added
+- **Unknown-URN strategy** (`Builder.unknownUrnStrategy(String)`, `fail` | `delete` |
+  `release` | `dead_letter`, the core `UnknownUrnStrategy` names). `release` calls
+  `ChangeMessageVisibility` with `Builder.unknownUrnReleaseDelaySeconds(int)` (**default `0`**,
+  matching the Python and Node transports; clamped to 0–43200); `dead_letter` degrades to
+  `delete` (this transport has no DLQ publisher — the contract's "DLQ disabled" rule). Default
+  stays backward compatible: `fail`, or `delete` when only `onUnknownUrn` is set.
+  `onUnknownUrn` is now invoked before every strategy.
+- `SqsConsumer.MAX_VISIBILITY_TIMEOUT_SECONDS` (43200).
+- `.github/dependabot.yml` (Maven + GitHub Actions, weekly).
+
+## [1.1.0] - 2026-06-21
+
 ### Added
 - **OpenTelemetry `traceparent` transport wiring (ADR-0028, v0.2).** `SqsPublisher`
   gains `publishWithHeaders(Envelope, Map<String,String>)` — the produce-side seam the

@@ -15,7 +15,7 @@ as the PHP/Laravel, Python, Go, Node and .NET SDKs. Implements
 <dependency>
   <groupId>com.babelqueue</groupId>
   <artifactId>babelqueue-sqs</artifactId>
-  <version>1.0.0</version>
+  <version>1.2.0</version>
 </dependency>
 ```
 
@@ -58,10 +58,29 @@ For LocalStack/ElasticMQ, point the `SqsClient`'s endpoint there.
 | `attempts` | reconciled to `ApproximateReceiveCount − 1` on receive |
 | reserve / ack | visibility timeout → `DeleteMessage` |
 
-Retry is **SQS-native**: a throwing handler leaves the message undeleted, so SQS
-redelivers it after the visibility timeout (at-least-once). The poll loop never stops on
-a bad message — observe via `onError` / `onUnknownUrn`. The envelope is unchanged
+Retry is **SQS-native**: a throwing handler's message is never deleted — it is
+*released* with `ChangeMessageVisibility(ReceiptHandle, VisibilityTimeout = releaseDelaySeconds)`
+and SQS redelivers it (at-least-once). The default delay is `0` (redeliver now); out-of-range
+values are clamped to 0–43200 s. A failed `DeleteMessage` after a successful handler is
+reported as `SqsDeleteException` and is **not** released (the message returns after its
+visibility timeout). The poll loop never stops on a bad message, a failed release or a failed
+delete — observe via `onError` / `onUnknownUrn`. The envelope is unchanged
 (`schema_version` stays `1`); SQS is purely additive.
+
+```java
+SqsConsumer.builder(sqs, url)
+    .handler("urn:babel:orders:created", handler)
+    .releaseDelaySeconds(30)                          // backoff between attempts (default 0)
+    .unknownUrnStrategy(UnknownUrnStrategy.RELEASE)   // fail | delete | release | dead_letter
+    .unknownUrnReleaseDelaySeconds(60)                // default 0
+    .build();
+```
+
+> **Poison messages.** With the default `0` delay, a message that always fails is redelivered
+> on every receive. Give the queue a **`RedrivePolicy`** (`deadLetterTargetArn` +
+> `maxReceiveCount`) so SQS moves it to a native DLQ after N receives, and set a non-zero
+> `releaseDelaySeconds` when the handler depends on something that can be briefly
+> unavailable — otherwise a short outage can use up `maxReceiveCount` in under a second.
 
 ## Trace propagation (OpenTelemetry `traceparent`, ADR-0028)
 

@@ -7,6 +7,8 @@ import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import software.amazon.awssdk.services.sqs.SqsClient;
+import software.amazon.awssdk.services.sqs.model.ChangeMessageVisibilityRequest;
+import software.amazon.awssdk.services.sqs.model.ChangeMessageVisibilityResponse;
 import software.amazon.awssdk.services.sqs.model.DeleteMessageRequest;
 import software.amazon.awssdk.services.sqs.model.DeleteMessageResponse;
 import software.amazon.awssdk.services.sqs.model.Message;
@@ -20,7 +22,12 @@ final class FakeSqsClient implements SqsClient {
 
     final List<SendMessageRequest> sent = new ArrayList<>();
     final List<String> deleted = new ArrayList<>();
+    final List<ChangeMessageVisibilityRequest> visibilityChanges = new ArrayList<>();
     ReceiveMessageRequest lastReceive;
+    /** When set, only {@code changeMessageVisibility} throws it (a failed release). */
+    RuntimeException visibilityError;
+    /** When set, only {@code deleteMessage} throws it (a failed acknowledgement). */
+    RuntimeException deleteError;
 
     private final Map<String, Deque<Message>> queues = new HashMap<>();
     private final RuntimeException error;
@@ -81,8 +88,23 @@ final class FakeSqsClient implements SqsClient {
         if (error != null) {
             throw error;
         }
+        if (deleteError != null) {
+            throw deleteError;
+        }
         deleted.add(request.receiptHandle());
         return DeleteMessageResponse.builder().build();
+    }
+
+    @Override
+    public ChangeMessageVisibilityResponse changeMessageVisibility(ChangeMessageVisibilityRequest request) {
+        if (error != null) {
+            throw error;
+        }
+        visibilityChanges.add(request);
+        if (visibilityError != null) {
+            throw visibilityError;
+        }
+        return ChangeMessageVisibilityResponse.builder().build();
     }
 
     /** Seed a raw message with a chosen ApproximateReceiveCount. */
