@@ -9,7 +9,7 @@ The envelope wire format is versioned separately by `meta.schema_version`
 
 ## [Unreleased]
 
-## [1.2.0] - 2026-10-01
+## [1.2.0] - 2026-10-03
 
 MINOR release: the failure path's behaviour and the public `Builder` API change.
 
