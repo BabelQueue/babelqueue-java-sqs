@@ -9,6 +9,8 @@ The envelope wire format is versioned separately by `meta.schema_version`
 
 ## [Unreleased]
 
+## [1.2.1] - 2026-10-10
+
 ### Fixed
 
 - `SqsConsumer` now applies the §3.7 schema-version gate **before** decoding the body: when the

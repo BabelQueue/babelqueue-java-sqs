@@ -15,7 +15,7 @@ as the PHP/Laravel, Python, Go, Node and .NET SDKs. Implements
 <dependency>
   <groupId>com.babelqueue</groupId>
   <artifactId>babelqueue-sqs</artifactId>
-  <version>1.2.0</version>
+  <version>1.2.1</version>
 </dependency>
 ```
 
