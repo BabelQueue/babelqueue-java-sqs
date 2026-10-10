@@ -14,6 +14,7 @@ import software.amazon.awssdk.services.sqs.SqsClient;
 import software.amazon.awssdk.services.sqs.model.ChangeMessageVisibilityRequest;
 import software.amazon.awssdk.services.sqs.model.DeleteMessageRequest;
 import software.amazon.awssdk.services.sqs.model.Message;
+import software.amazon.awssdk.services.sqs.model.MessageAttributeValue;
 import software.amazon.awssdk.services.sqs.model.ReceiveMessageRequest;
 
 /**
@@ -33,13 +34,27 @@ import software.amazon.awssdk.services.sqs.model.ReceiveMessageRequest;
  * The poll loop never stops on a bad message, a failed release or a failed delete — observe via
  * {@code onError}/{@code onUnknownUrn}. Configure a queue {@code RedrivePolicy} so a poison
  * message, redelivered immediately under the default {@code 0} delay, ends in a native DLQ.
+ *
+ * <p>Per §3.7 the {@code bq-schema-version} message attribute is checked <b>before</b> the body is
+ * decoded: when it is present and is not exactly the schema version the core supports
+ * ({@link EnvelopeCodec#SCHEMA_VERSION}, compared exactly as sent, with no trimming — so {@code "2"},
+ * {@code "x"}, {@code "01"} and {@code " 1"} are all unknown), the body is never decoded or routed;
+ * {@code onError} is notified (with a {@code null} envelope) and the message is neither deleted nor
+ * released — the same settle path as a non-conformant envelope, so the queue's redrive policy moves it
+ * to the native DLQ. A missing or blank (empty or ASCII-whitespace-only: space, tab, LF, VT, FF, CR)
+ * attribute changes nothing, and a {@code "1"} attribute still goes through the post-decode
+ * {@link EnvelopeCodec#accepts} check.
  */
 public final class SqsConsumer {
 
+    private static final String SCHEMA_VERSION_ATTRIBUTE = "bq-schema-version";
+
     /**
      * Notified of a non-conformant envelope, an unmapped URN (no {@code onUnknownUrn}), a throwing
-     * handler, a failed release ({@code ChangeMessageVisibility} error), or a failed delete of a
-     * processed message (reported as {@link SqsDeleteException}; the message is not released).
+     * handler, a failed release ({@code ChangeMessageVisibility} error), a failed delete of a
+     * processed message (reported as {@link SqsDeleteException}; the message is not released), or a
+     * message rejected by the §3.7 schema-version gate. {@code envelope} is {@code null} when the body
+     * was not decoded (a version-gated message) — guard against it before dereferencing.
      */
     @FunctionalInterface
     public interface ErrorHandler {
@@ -121,6 +136,15 @@ public final class SqsConsumer {
     }
 
     private void handle(Message message) {
+        String declaredVersion = rawSchemaVersion(message);
+        if (declaredVersion != null && !isBlankSchemaVersion(declaredVersion)
+            && !declaredVersion.equals(Integer.toString(EnvelopeCodec.SCHEMA_VERSION))) {
+            report(new BabelQueueException("Rejected a BabelQueue message with unsupported "
+                + SCHEMA_VERSION_ATTRIBUTE + " attribute '" + declaredVersion + "' (supported: "
+                + EnvelopeCodec.SCHEMA_VERSION + "); body not decoded."), null, message);
+            return;
+        }
+
         String body = message.body() == null ? "" : message.body();
         Envelope envelope = reconcile(
             EnvelopeCodec.decode(body),
@@ -151,6 +175,30 @@ public final class SqsConsumer {
         // Outside the handler's try: a failed delete is not a handler failure, so it is
         // reported as SqsDeleteException and the message is never released.
         delete(message, envelope);
+    }
+
+    /** The {@code bq-schema-version} attribute's string value exactly as sent (no trimming), or {@code null} when absent. */
+    private static String rawSchemaVersion(Message message) {
+        if (!message.hasMessageAttributes()) {
+            return null;
+        }
+        MessageAttributeValue attribute = message.messageAttributes().get(SCHEMA_VERSION_ATTRIBUTE);
+        return attribute == null ? null : attribute.stringValue();
+    }
+
+    /**
+     * The shared cross-SDK "blank" definition for {@code bq-schema-version}: the empty string, or a value made up
+     * <b>only</b> of ASCII whitespace ({@code ' '}, {@code \t}, {@code \n}, U+000B, {@code \f}, {@code \r}). Anything else
+     * (NBSP, U+001C–U+001F, U+0085, U+FEFF, …) is <b>not</b> blank, unlike {@link String#isBlank()}.
+     */
+    private static boolean isBlankSchemaVersion(String value) {
+        for (int i = 0; i < value.length(); i++) {
+            char c = value.charAt(i);
+            if (c != ' ' && (c < '\t' || c > '\r')) {
+                return false;
+            }
+        }
+        return true;
     }
 
     private void handleUnknownUrn(String urn, Envelope envelope, Message message) {

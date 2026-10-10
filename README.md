@@ -67,6 +67,12 @@ visibility timeout). The poll loop never stops on a bad message, a failed releas
 delete — observe via `onError` / `onUnknownUrn`. The envelope is unchanged
 (`schema_version` stays `1`); SQS is purely additive.
 
+**Schema-version gate (§3.7).** Before decoding the body the consumer reads the
+`bq-schema-version` attribute. Missing or blank (empty / ASCII whitespace only) → normal decode.
+Any other value that is not exactly `1` (no trimming — `"2"`, `"x"`, `" 1"`) → the body is **not**
+decoded, the handler is not called, `onError` is notified with a `null` envelope, and the message is
+left undeleted so SQS redrives it to the DLQ.
+
 ```java
 SqsConsumer.builder(sqs, url)
     .handler("urn:babel:orders:created", handler)

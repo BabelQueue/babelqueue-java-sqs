@@ -18,6 +18,8 @@ import java.util.List;
 import java.util.Map;
 import org.junit.jupiter.api.Test;
 import software.amazon.awssdk.services.sqs.model.ChangeMessageVisibilityRequest;
+import software.amazon.awssdk.services.sqs.model.MessageAttributeValue;
+import software.amazon.awssdk.services.sqs.model.SendMessageRequest;
 
 class SqsConsumerTest {
 
@@ -388,5 +390,64 @@ class SqsConsumerTest {
         RuntimeException e = assertThrows(RuntimeException.class,
             () -> SqsConsumer.builder(sqs, URL).build().poll());
         assertEquals("aws down", e.getMessage());
+    }
+
+    // ---- §3.7 schema-version gate -------------------------------------------------------------
+
+    private static void sendWithVersion(FakeSqsClient sqs, String body, String version) {
+        SendMessageRequest.Builder request = SendMessageRequest.builder().queueUrl(URL).messageBody(body);
+        if (version != null) {
+            request.messageAttributes(Map.of("bq-schema-version",
+                MessageAttributeValue.builder().dataType("Number").stringValue(version).build()));
+        }
+        sqs.sendMessage(request.build());
+    }
+
+    private static String validBody() {
+        return EnvelopeCodec.encode(
+            EnvelopeCodec.make("urn:babel:orders:created", Map.of("order_id", 7), "orders", null));
+    }
+
+    @Test
+    void schemaVersionGateDecodesWhenAttributeMissingBlankOrSupported() {
+        for (String version : new String[] {null, "", " \t", "\n\u000b\f\r", "1"}) {
+            FakeSqsClient sqs = new FakeSqsClient();
+            sendWithVersion(sqs, validBody(), version);
+
+            int[] handled = {0};
+            SqsConsumer.builder(sqs, URL)
+                .handler("urn:babel:orders:created", (e, m) -> handled[0]++)
+                .build().poll();
+
+            assertEquals(1, handled[0], "version=" + version);
+            assertEquals(1, sqs.deleted.size(), "version=" + version);
+        }
+    }
+
+    @Test
+    void schemaVersionGateRejectsWithoutDecodingOrHandlerAndLeavesMessage() {
+        for (String version : new String[] {"2", "x"}) {
+            FakeSqsClient sqs = new FakeSqsClient();
+            // A non-JSON body proves the body is never decoded: decoding it would throw out of poll().
+            sendWithVersion(sqs, "this is not json", version);
+
+            int[] handled = {0};
+            List<Envelope> envelopes = new ArrayList<>();
+            List<Throwable> errors = new ArrayList<>();
+            SqsConsumer.builder(sqs, URL)
+                .handler("urn:babel:orders:created", (e, m) -> handled[0]++)
+                .onError((err, env, msg) -> {
+                    errors.add(err);
+                    envelopes.add(env);
+                })
+                .build().poll();
+
+            assertEquals(0, handled[0], "version=" + version);
+            assertEquals(1, errors.size(), "version=" + version);
+            assertInstanceOf(BabelQueueException.class, errors.get(0));
+            assertNull(envelopes.get(0), "version=" + version);
+            assertTrue(sqs.deleted.isEmpty(), "version=" + version);
+            assertTrue(sqs.visibilityChanges.isEmpty(), "version=" + version);
+        }
     }
 }

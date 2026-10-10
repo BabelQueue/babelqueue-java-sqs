@@ -9,6 +9,17 @@ The envelope wire format is versioned separately by `meta.schema_version`
 
 ## [Unreleased]
 
+### Fixed
+
+- `SqsConsumer` now applies the §3.7 schema-version gate **before** decoding the body: when the
+  `bq-schema-version` message attribute is present and is not the supported version (`1`), the body is
+  never decoded and the handler is never called; the message is reported via `onError` (with a `null`
+  envelope) and is **not** deleted, so SQS redrives it to the DLQ. A missing or blank attribute (empty or
+  ASCII-whitespace-only) keeps the existing decode path. Cross-SDK parity (GR-5): the value is compared
+  exactly, with no trimming.
+- `onError` may now receive a `null` envelope for a schema-version gate rejection (the body is not decoded, so
+  there is no envelope); callbacks that dereference the envelope should null-check it.
+
 ## [1.2.0] - 2026-10-03
 
 MINOR release: the failure path's behaviour and the public `Builder` API change.

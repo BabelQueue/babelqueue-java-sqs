@@ -1,16 +1,20 @@
 package com.babelqueue.sqs;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import com.babelqueue.Envelope;
 import com.babelqueue.EnvelopeCodec;
 import java.io.InputStream;
 import java.nio.charset.StandardCharsets;
+import java.util.ArrayList;
+import java.util.List;
 import java.util.Map;
 import org.json.JSONArray;
 import org.json.JSONObject;
 import org.junit.jupiter.api.Test;
 import software.amazon.awssdk.services.sqs.model.MessageAttributeValue;
+import software.amazon.awssdk.services.sqs.model.SendMessageRequest;
 
 /**
  * Amazon SQS binding conformance against the vendored canonical suite's {@code sqs}
@@ -71,6 +75,38 @@ class SqsConformanceTest {
                 .poll();
 
             assertEquals(testCase.getInt("expected_attempts"), seen[0], testCase.getString("name"));
+        }
+    }
+
+    @Test
+    void schemaVersionGateMatchesGolden() throws Exception {
+        JSONObject gate = sqsBlock().getJSONObject("schema_version_gate");
+        String property = gate.getString("property");
+        String fixture = resource(gate.getString("fixture"));
+        JSONArray cases = gate.getJSONArray("cases");
+        assertTrue(cases.length() > 0);
+
+        for (int i = 0; i < cases.length(); i++) {
+            JSONObject testCase = cases.getJSONObject(i);
+            String label = testCase.has("value") ? "value=" + testCase.get("value") : "absent";
+
+            SendMessageRequest.Builder request = SendMessageRequest.builder().queueUrl(URL).messageBody(fixture);
+            if (!testCase.optBoolean("absent", false)) {
+                request.messageAttributes(Map.of(property,
+                    MessageAttributeValue.builder().dataType("Number").stringValue(testCase.getString("value")).build()));
+            }
+            FakeSqsClient sqs = new FakeSqsClient();
+            sqs.sendMessage(request.build());
+
+            List<String> handled = new ArrayList<>();
+            SqsConsumer.builder(sqs, URL)
+                .handler("urn:babel:orders:created", (env, message) -> handled.add(env.job()))
+                .build()
+                .poll();
+
+            boolean decode = "decode".equals(testCase.getString("expect"));
+            assertEquals(decode ? 1 : 0, handled.size(), label);
+            assertEquals(decode ? 1 : 0, sqs.deleted.size(), label);
         }
     }
 }
