@@ -77,6 +77,8 @@ left undeleted so SQS redrives it to the DLQ.
 SqsConsumer.builder(sqs, url)
     .handler("urn:babel:orders:created", handler)
     .releaseDelaySeconds(30)                          // backoff between attempts (default 0)
+    // A9 backoff, optional: d(n) = min(max, base * multiplier^(n-1)); releaseDelaySeconds is the base alias
+    //.retryBackoff(5).retryBackoffMultiplier(2).retryBackoffMax(300).retryJitter("full")
     .unknownUrnStrategy(UnknownUrnStrategy.RELEASE)   // fail | delete | release | dead_letter
     .unknownUrnReleaseDelaySeconds(60)                // default 0
     .build();

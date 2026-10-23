@@ -9,7 +9,9 @@ import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
+import java.util.concurrent.ThreadLocalRandom;
 import java.util.function.BooleanSupplier;
+import java.util.function.DoubleSupplier;
 import software.amazon.awssdk.services.sqs.SqsClient;
 import software.amazon.awssdk.services.sqs.model.ChangeMessageVisibilityRequest;
 import software.amazon.awssdk.services.sqs.model.DeleteMessageRequest;
@@ -79,7 +81,11 @@ public final class SqsConsumer {
     private final ErrorHandler onError;
     private final UnknownUrnHandler onUnknownUrn;
     private final String unknownUrnStrategy;
-    private final int releaseDelaySeconds;
+    private final double retryBackoffSeconds;
+    private final double retryBackoffMultiplier;
+    private final double retryBackoffMaxSeconds;
+    private final boolean retryJitterFull;
+    private final DoubleSupplier random;
     private final int unknownUrnReleaseDelaySeconds;
 
     /** The SQS maximum for {@code VisibilityTimeout}: 12 hours, in seconds. */
@@ -97,7 +103,11 @@ public final class SqsConsumer {
         this.unknownUrnStrategy = builder.unknownUrnStrategy != null
             ? builder.unknownUrnStrategy
             : (builder.onUnknownUrn != null ? UnknownUrnStrategy.DELETE : UnknownUrnStrategy.FAIL);
-        this.releaseDelaySeconds = builder.releaseDelaySeconds;
+        this.retryBackoffSeconds = builder.retryBackoffSeconds;
+        this.retryBackoffMultiplier = builder.retryBackoffMultiplier;
+        this.retryBackoffMaxSeconds = builder.retryBackoffMaxSeconds;
+        this.retryJitterFull = builder.retryJitterFull;
+        this.random = builder.random != null ? builder.random : () -> ThreadLocalRandom.current().nextDouble();
         this.unknownUrnReleaseDelaySeconds = builder.unknownUrnReleaseDelaySeconds;
     }
 
@@ -169,7 +179,7 @@ public final class SqsConsumer {
             // Never delete on failure: report first, then release with the backoff so SQS
             // redelivers it. A failed release is reported too and never escapes the poll loop.
             report(error, envelope, message);
-            release(message, releaseDelaySeconds, envelope);
+            release(message, failureDelaySeconds(envelope), envelope);
             return;
         }
         // Outside the handler's try: a failed delete is not a handler failure, so it is
@@ -244,6 +254,37 @@ public final class SqsConsumer {
     }
 
     /**
+     * The visibility timeout (whole seconds) for the failure of {@code envelope}: the A9
+     * {@code retry_backoff} schedule {@code d(n) = min(max, base * multiplier^(n-1))} with
+     * {@code n = attempts + 1} (1-based; {@code attempts} is the SQS-reconciled count of earlier
+     * receives), optional full jitter {@code uniform(0, d(n))}, rounded up to a whole second and
+     * clamped to the SQS range 0-43200. With the defaults (multiplier 1, no cap, no jitter) this is
+     * the constant {@code releaseDelaySeconds}, i.e. the pre-A9 behaviour.
+     */
+    private int failureDelaySeconds(Envelope envelope) {
+        int n = Math.max(envelope.attempts(), 0) + 1;
+        double d = retryBackoffSeconds;
+        if (d > 0 && retryBackoffMultiplier != 1.0 && n > 1) {
+            // A zero base stays zero: skipping pow() avoids 0 * Infinity = NaN for a huge n.
+            d = retryBackoffSeconds * Math.pow(retryBackoffMultiplier, n - 1);
+        }
+        if (Double.isNaN(d) || d > MAX_VISIBILITY_TIMEOUT_SECONDS) {
+            d = MAX_VISIBILITY_TIMEOUT_SECONDS;
+        }
+        if (retryBackoffMaxSeconds > 0 && d > retryBackoffMaxSeconds) {
+            d = retryBackoffMaxSeconds;
+        }
+        if (retryJitterFull) {
+            d = d * random.getAsDouble();
+        }
+        return clampSeconds((int) Math.ceil(d));
+    }
+
+    private static int clampSeconds(int seconds) {
+        return Math.max(0, Math.min(seconds, MAX_VISIBILITY_TIMEOUT_SECONDS));
+    }
+
+    /**
      * Release (retry): {@code ChangeMessageVisibility(ReceiptHandle, delaySeconds)} — never a delete.
      * A broker error (stale receipt handle, throttling, network) is reported via {@code onError}
      * and swallowed: the message is still redelivered once its visibility timeout expires, and
@@ -301,7 +342,11 @@ public final class SqsConsumer {
         private ErrorHandler onError;
         private UnknownUrnHandler onUnknownUrn;
         private String unknownUrnStrategy;
-        private int releaseDelaySeconds;
+        private double retryBackoffSeconds;
+        private double retryBackoffMultiplier = 1.0;
+        private double retryBackoffMaxSeconds;
+        private boolean retryJitterFull;
+        private DoubleSupplier random;
         private int unknownUrnReleaseDelaySeconds;
 
         private Builder(SqsClient client, String queueUrl) {
@@ -360,7 +405,57 @@ public final class SqsConsumer {
          * non-zero delay here.
          */
         public Builder releaseDelaySeconds(int seconds) {
-            this.releaseDelaySeconds = clampDelay(seconds);
+            this.retryBackoffSeconds = clampDelay(seconds);
+            return this;
+        }
+
+        /**
+         * A9 {@code retry_backoff}: the base delay in seconds (default {@code 0}). The same knob as
+         * {@link #releaseDelaySeconds(int)}, which stays as its alias; fractional values are rounded
+         * up to a whole second on release (SQS visibility timeouts are integral).
+         */
+        public Builder retryBackoff(double seconds) {
+            if (Double.isNaN(seconds) || Double.isInfinite(seconds) || seconds < 0) {
+                throw new IllegalArgumentException("retry_backoff must be a finite number >= 0");
+            }
+            this.retryBackoffSeconds = Math.min(seconds, MAX_VISIBILITY_TIMEOUT_SECONDS);
+            return this;
+        }
+
+        /** A9 {@code retry_backoff_multiplier} (default {@code 1}, must be {@code >= 1}). */
+        public Builder retryBackoffMultiplier(double multiplier) {
+            if (Double.isNaN(multiplier) || Double.isInfinite(multiplier) || multiplier < 1) {
+                throw new IllegalArgumentException("retry_backoff_multiplier must be a finite number >= 1");
+            }
+            this.retryBackoffMultiplier = multiplier;
+            return this;
+        }
+
+        /** A9 {@code retry_backoff_max} in seconds (default {@code 0} = unlimited). */
+        public Builder retryBackoffMax(double seconds) {
+            if (Double.isNaN(seconds) || Double.isInfinite(seconds) || seconds < 0) {
+                throw new IllegalArgumentException("retry_backoff_max must be a finite number >= 0");
+            }
+            this.retryBackoffMaxSeconds = seconds;
+            return this;
+        }
+
+        /** A9 {@code retry_jitter}: {@code "none"} (default) or {@code "full"}. */
+        public Builder retryJitter(String jitter) {
+            Objects.requireNonNull(jitter, "jitter");
+            // Same normalisation as the core RetryBackoff.Jitter.parse (strip + case-insensitive); the core
+            // class is not usable here until this module's core pin moves past 1.8.0.
+            switch (jitter.strip().toLowerCase(java.util.Locale.ROOT)) {
+                case "none" -> this.retryJitterFull = false;
+                case "full" -> this.retryJitterFull = true;
+                default -> throw new IllegalArgumentException("retry_jitter must be 'none' or 'full', got: " + jitter);
+            }
+            return this;
+        }
+
+        /** Test seam: the uniform [0,1) source used by full jitter. */
+        Builder randomSource(DoubleSupplier source) {
+            this.random = Objects.requireNonNull(source, "source");
             return this;
         }
 

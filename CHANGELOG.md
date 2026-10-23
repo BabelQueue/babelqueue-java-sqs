@@ -9,6 +9,23 @@ The envelope wire format is versioned separately by `meta.schema_version`
 
 ## [Unreleased]
 
+### Added
+
+- `SqsConsumer.Builder` now exposes the shared A9 retry-backoff parameters (ADR-0034 §9):
+  `retryBackoff(seconds)`, `retryBackoffMultiplier(m)`, `retryBackoffMax(seconds)` and
+  `retryJitter("none" | "full")` (the jitter name is trimmed and matched case-insensitively, like the
+  core `RetryBackoff`). The visibility timeout on a handler failure is
+  `min(max, base * multiplier^(n-1))` (n = receives so far, 1-based), optionally `uniform(0, d(n))`,
+  rounded up to a whole second and clamped to 0-43200. `releaseDelaySeconds(int)` stays as the alias
+  of the base, so the defaults (multiplier 1, no cap, no jitter) keep the constant release delay.
+  A zero base delay stays `0` even when `multiplier^(n-1)` overflows to infinity.
+  Implemented locally in the consumer: this module still builds against `babelqueue-core` 1.8.0.
+
+### Changed
+
+- Vendored the cross-SDK conformance suite v1.6.0 (no SQS case changed) and pinned `fetch.sh` by
+  SHA-256 (`BQ_FETCH_SH_SHA256`) in the CI workflow.
+
 ## [1.2.1] - 2026-10-10
 
 ### Fixed
