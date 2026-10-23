@@ -11,7 +11,7 @@ The envelope wire format is versioned separately by `meta.schema_version`
 
 ### Added
 
-- `SqsConsumer.Builder` now exposes the shared A9 retry-backoff parameters (ADR-0034 §9):
+- `SqsConsumer.Builder` now exposes the shared retry-backoff parameters (ADR-0034 §9):
   `retryBackoff(seconds)`, `retryBackoffMultiplier(m)`, `retryBackoffMax(seconds)` and
   `retryJitter("none" | "full")` (the jitter name is trimmed and matched case-insensitively, like the
   core `RetryBackoff`). The visibility timeout on a handler failure is
