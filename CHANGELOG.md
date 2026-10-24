@@ -9,6 +9,8 @@ The envelope wire format is versioned separately by `meta.schema_version`
 
 ## [Unreleased]
 
+## [1.3.0] - 2026-10-24
+
 ### Added
 
 - `SqsConsumer.Builder` now exposes the shared retry-backoff parameters (ADR-0034 §9):
@@ -19,7 +21,7 @@ The envelope wire format is versioned separately by `meta.schema_version`
   rounded up to a whole second and clamped to 0-43200. `releaseDelaySeconds(int)` stays as the alias
   of the base, so the defaults (multiplier 1, no cap, no jitter) keep the constant release delay.
   A zero base delay stays `0` even when `multiplier^(n-1)` overflows to infinity.
-  Implemented locally in the consumer: this module still builds against `babelqueue-core` 1.8.0.
+  Implemented locally in the consumer: this module now builds against `babelqueue-core` 1.13.0.
 
 ### Changed
 
