@@ -450,4 +450,281 @@ class SqsConsumerTest {
             assertTrue(sqs.visibilityChanges.isEmpty(), "version=" + version);
         }
     }
+    // ---- ADR-0037: poison, version gate and the DLQ queue ---------------------------------------
+
+    private static final String DLQ_URL = "https://sqs.eu-central-1.amazonaws.com/123456789012/orders.dlq";
+    private static final String FIFO_DLQ_URL = "https://sqs.eu-central-1.amazonaws.com/123456789012/orders.dlq.fifo";
+
+    private static SqsConsumer.Builder consumerWithDlq(FakeSqsClient sqs, List<Throwable> errors, int[] handled) {
+        return SqsConsumer.builder(sqs, URL)
+            .handler("urn:babel:orders:created", (e, m) -> handled[0]++)
+            .onError((err, env, msg) -> errors.add(err))
+            .deadLetterQueueUrl(DLQ_URL);
+    }
+
+    private static org.json.JSONObject sentJson(FakeSqsClient sqs, int index) {
+        return new org.json.JSONObject(sqs.sent.get(index).messageBody());
+    }
+
+    @Test
+    void poisonBodyWithDlqWritesTheAdr0035RecordThenDeletes() {
+        FakeSqsClient sqs = new FakeSqsClient();
+        sqs.seed(URL, "{\"not\":\"an envelope\",\"big\":12345678901234567890}", 4);
+        List<Throwable> errors = new ArrayList<>();
+        int[] handled = {0};
+
+        consumerWithDlq(sqs, errors, handled).build().poll();
+
+        assertEquals(0, handled[0]);
+        assertEquals(1, sqs.sent.size());
+        assertEquals(DLQ_URL, sqs.sent.get(0).queueUrl());
+        // An object body is spliced: every original member stays as written, plus the dead_letter block.
+        assertTrue(sqs.sent.get(0).messageBody().contains("\"big\":12345678901234567890"));
+        org.json.JSONObject block = sentJson(sqs, 0).getJSONObject("dead_letter");
+        assertEquals("poison", block.getString("reason"));
+        assertEquals("orders", block.getString("original_queue"));
+        assertEquals(3, block.getInt("attempts"));
+        assertEquals(1, sqs.deleted.size());
+        assertTrue(sqs.visibilityChanges.isEmpty());
+        assertEquals(1, errors.size());
+    }
+
+    @Test
+    void poisonNonJsonBodyIsWrappedUnderRaw() {
+        FakeSqsClient sqs = new FakeSqsClient();
+        sqs.seed(URL, "plain text, not JSON", 1);
+
+        consumerWithDlq(sqs, new ArrayList<>(), new int[1]).build().poll();
+
+        org.json.JSONObject record = sentJson(sqs, 0);
+        assertEquals("plain text, not JSON", record.getString("raw"));
+        assertEquals("poison", record.getJSONObject("dead_letter").getString("reason"));
+        assertEquals(1, sqs.deleted.size());
+    }
+
+    @Test
+    void poisonWithUnsupportedMetaSchemaVersionIsDeadLettered() {
+        FakeSqsClient sqs = new FakeSqsClient();
+        String body = validBody().replace("\"schema_version\":1", "\"schema_version\":2");
+        sqs.seed(URL, body, 1);
+        int[] handled = {0};
+
+        consumerWithDlq(sqs, new ArrayList<>(), handled).build().poll();
+
+        assertEquals(0, handled[0]);
+        assertEquals("poison", sentJson(sqs, 0).getJSONObject("dead_letter").getString("reason"));
+        assertEquals(1, sqs.deleted.size());
+    }
+
+    @Test
+    void poisonFailedDlqWriteLeavesItUnsettledAndReports() {
+        FakeSqsClient sqs = new FakeSqsClient();
+        sqs.seed(URL, "{}", 1);
+        sqs.sendError = new IllegalStateException("dlq down");
+        List<Throwable> errors = new ArrayList<>();
+
+        consumerWithDlq(sqs, errors, new int[1]).build().poll();
+
+        assertTrue(sqs.deleted.isEmpty());
+        assertTrue(sqs.visibilityChanges.isEmpty());
+        assertEquals(2, errors.size());
+        assertEquals("dlq down", errors.get(1).getMessage());
+    }
+
+    @Test
+    void poisonWithoutDlqIsLeftToTheNativeMechanism() {
+        FakeSqsClient sqs = new FakeSqsClient();
+        sqs.seed(URL, "{}", 1);
+        List<Throwable> errors = new ArrayList<>();
+
+        SqsConsumer.builder(sqs, URL).onError((err, env, msg) -> errors.add(err)).build().poll();
+
+        assertEquals(1, errors.size());
+        assertTrue(sqs.sent.isEmpty());
+        assertTrue(sqs.deleted.isEmpty());
+        assertTrue(sqs.visibilityChanges.isEmpty());
+    }
+
+    @Test
+    void poisonWithDeleteStrategyIsDeletedWithoutARecord() {
+        FakeSqsClient sqs = new FakeSqsClient();
+        sqs.seed(URL, "{}", 1);
+
+        consumerWithDlq(sqs, new ArrayList<>(), new int[1]).unknownUrnStrategy(UnknownUrnStrategy.DELETE).build().poll();
+
+        assertTrue(sqs.sent.isEmpty());
+        assertEquals(1, sqs.deleted.size());
+    }
+
+    @Test
+    void poisonWithDeadLetterStrategyButNoDlqQueueIsNative() {
+        FakeSqsClient sqs = new FakeSqsClient();
+        sqs.seed(URL, "{}", 1);
+
+        SqsConsumer.builder(sqs, URL).unknownUrnStrategy(UnknownUrnStrategy.DEAD_LETTER).build().poll();
+
+        assertTrue(sqs.sent.isEmpty());
+        assertTrue(sqs.deleted.isEmpty());
+    }
+
+    @Test
+    void poisonToAFifoDlqCarriesGroupAndDeduplicationIds() {
+        FakeSqsClient sqs = new FakeSqsClient();
+        sqs.seed(URL, "{}", 1);
+
+        SqsConsumer.builder(sqs, URL).deadLetterQueueUrl(FIFO_DLQ_URL).build().poll();
+
+        SendMessageRequest sent = sqs.sent.get(0);
+        assertEquals(FIFO_DLQ_URL, sent.queueUrl());
+        assertEquals("orders", sent.messageGroupId());
+        assertNotNull(sent.messageDeduplicationId());
+        assertTrue(sent.messageDeduplicationId().length() <= 128);
+        assertEquals(1, sqs.deleted.size());
+    }
+
+    @Test
+    void versionGatedWithDlqWritesTheRawBodyThenDeletes() {
+        FakeSqsClient sqs = new FakeSqsClient();
+        // Deliberately non-canonical: a writer that decodes and re-encodes would change these bytes.
+        String raw = "{\"meta\": {\"schema_version\": 2}, \"job\": \"urn:babel:orders:created\", \"data\": {\"n\": 1.50}}\n";
+        sendWithVersion(sqs, raw, "2");
+        sqs.sent.clear();
+        List<Throwable> errors = new ArrayList<>();
+        int[] handled = {0};
+        int[] unknown = {0};
+
+        consumerWithDlq(sqs, errors, handled).onUnknownUrn((e, m) -> unknown[0]++).build().poll();
+
+        assertEquals(0, handled[0]);
+        assertEquals(0, unknown[0]);
+        assertEquals(1, sqs.sent.size());
+        assertEquals(DLQ_URL, sqs.sent.get(0).queueUrl());
+        assertEquals(raw, sqs.sent.get(0).messageBody());
+        assertTrue(!sqs.sent.get(0).messageBody().contains("dead_letter"));
+        assertEquals(1, sqs.deleted.size());
+        assertEquals(1, errors.size());
+    }
+
+    @Test
+    void versionGatedIsSettledOnTheFirstDeliveryWhateverTheReceiveCountSays() {
+        FakeSqsClient sqs = new FakeSqsClient();
+        sqs.seed(URL, "body", 9, Map.of("bq-schema-version",
+            MessageAttributeValue.builder().dataType("Number").stringValue("2").build()));
+
+        consumerWithDlq(sqs, new ArrayList<>(), new int[1]).build().poll();
+
+        assertEquals(1, sqs.sent.size());
+        assertEquals(1, sqs.deleted.size());
+    }
+
+    @Test
+    void versionGatedFailedDlqWriteLeavesItUnsettledAndReports() {
+        FakeSqsClient sqs = new FakeSqsClient();
+        sendWithVersion(sqs, "not json", "2");
+        sqs.sendError = new IllegalStateException("dlq down");
+        List<Throwable> errors = new ArrayList<>();
+
+        consumerWithDlq(sqs, errors, new int[1]).build().poll();
+
+        assertTrue(sqs.deleted.isEmpty());
+        assertTrue(sqs.visibilityChanges.isEmpty());
+        assertEquals(2, errors.size());
+    }
+
+    @Test
+    void versionGatedWithDeleteStrategyIsDeletedWithoutARecord() {
+        FakeSqsClient sqs = new FakeSqsClient();
+        sendWithVersion(sqs, "not json", "2");
+        sqs.sent.clear();
+
+        consumerWithDlq(sqs, new ArrayList<>(), new int[1]).unknownUrnStrategy(UnknownUrnStrategy.DELETE).build().poll();
+
+        assertTrue(sqs.sent.isEmpty());
+        assertEquals(1, sqs.deleted.size());
+    }
+
+    @Test
+    void versionGatedWithDeadLetterStrategyButNoDlqQueueIsNative() {
+        FakeSqsClient sqs = new FakeSqsClient();
+        sendWithVersion(sqs, "not json", "2");
+        sqs.sent.clear();
+
+        SqsConsumer.builder(sqs, URL).unknownUrnStrategy(UnknownUrnStrategy.DEAD_LETTER).build().poll();
+
+        assertTrue(sqs.sent.isEmpty());
+        assertTrue(sqs.deleted.isEmpty());
+        assertTrue(sqs.visibilityChanges.isEmpty());
+    }
+
+    @Test
+    void hookOnlyConsumerNeverDropsAVersionGatedDeliverySilently() {
+        // ADR-0037 "Configured strategy only": the delete that onUnknownUrn implies for an unknown URN must not
+        // reach the version gate. DLQ off -> native (not deleted); DLQ on -> raw record, and the hook never runs.
+        int[] unknown = {0};
+
+        FakeSqsClient off = new FakeSqsClient();
+        sendWithVersion(off, validBody(), "2");
+        off.sent.clear();
+        SqsConsumer.builder(off, URL).onUnknownUrn((e, m) -> unknown[0]++).build().poll();
+        assertTrue(off.deleted.isEmpty());
+        assertTrue(off.sent.isEmpty());
+
+        FakeSqsClient on = new FakeSqsClient();
+        String body = validBody();
+        sendWithVersion(on, body, "2");
+        on.sent.clear();
+        SqsConsumer.builder(on, URL).onUnknownUrn((e, m) -> unknown[0]++).deadLetterQueueUrl(DLQ_URL).build().poll();
+        assertEquals(1, on.sent.size());
+        assertEquals(body, on.sent.get(0).messageBody());
+        assertEquals(1, on.deleted.size());
+        assertEquals(0, unknown[0]);
+    }
+
+    @Test
+    void hookOnlyConsumerNeverDropsAPoisonBodySilently() {
+        FakeSqsClient off = new FakeSqsClient();
+        off.seed(URL, "{}", 1);
+        SqsConsumer.builder(off, URL).onUnknownUrn((e, m) -> { }).build().poll();
+        assertTrue(off.deleted.isEmpty());
+
+        FakeSqsClient on = new FakeSqsClient();
+        on.seed(URL, "{}", 1);
+        SqsConsumer.builder(on, URL).onUnknownUrn((e, m) -> { }).deadLetterQueueUrl(DLQ_URL).build().poll();
+        assertEquals("poison", sentJson(on, 0).getJSONObject("dead_letter").getString("reason"));
+        assertEquals(1, on.deleted.size());
+    }
+
+    @Test
+    void unknownUrnDeadLetterStrategyWritesTheAnnotatedEnvelopeThenDeletes() {
+        FakeSqsClient sqs = new FakeSqsClient();
+        sqs.seed(URL, validBody(), 1);
+
+        SqsConsumer.builder(sqs, URL).unknownUrnStrategy(UnknownUrnStrategy.DEAD_LETTER)
+            .deadLetterQueueUrl(DLQ_URL).build().poll();
+
+        assertEquals(1, sqs.sent.size());
+        assertEquals("unknown_urn", sentJson(sqs, 0).getJSONObject("dead_letter").getString("reason"));
+        assertEquals("urn:babel:orders:created", sentJson(sqs, 0).getString("job"));
+        assertEquals(1, sqs.deleted.size());
+    }
+
+    @Test
+    void unknownUrnDeadLetterFailedWriteLeavesItUnsettled() {
+        FakeSqsClient sqs = new FakeSqsClient();
+        sqs.seed(URL, validBody(), 1);
+        sqs.sendError = new IllegalStateException("dlq down");
+        List<Throwable> errors = new ArrayList<>();
+
+        SqsConsumer.builder(sqs, URL).unknownUrnStrategy(UnknownUrnStrategy.DEAD_LETTER)
+            .deadLetterQueueUrl(DLQ_URL).onError((err, env, msg) -> errors.add(err)).build().poll();
+
+        assertTrue(sqs.deleted.isEmpty());
+        assertEquals(1, errors.size());
+    }
+
+    @Test
+    void blankDeadLetterQueueUrlIsRejected() {
+        assertThrows(IllegalArgumentException.class,
+            () -> SqsConsumer.builder(new FakeSqsClient(), URL).deadLetterQueueUrl(" "));
+    }
 }
