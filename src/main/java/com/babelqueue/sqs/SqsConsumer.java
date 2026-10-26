@@ -48,7 +48,7 @@ import software.amazon.awssdk.services.sqs.model.SendMessageRequest;
  * (see below), redelivered immediately under the default {@code 0} delay, ends in a native DLQ.
  *
  * <p><b>Poison and version gate (ADR-0037).</b> "Dead-lettering on" means a {@link Builder#deadLetterQueueUrl DLQ
- * queue URL} is configured (opt-in; a FIFO DLQ is {@code <queue>.dlq.fifo}). Only the <em>explicitly configured</em>
+ * queue URL} is configured (opt-in; a FIFO DLQ is {@code <queue>-dlq.fifo}). Only the <em>explicitly configured</em>
  * {@link Builder#unknownUrnStrategy strategy} is read by these two rules (none configured means {@code fail}); an
  * {@code onUnknownUrn} hook, and the {@code delete} it implies for an unknown URN, never affect them.
  * <ul>
@@ -649,11 +649,11 @@ public final class SqsConsumer {
         }
 
         /**
-         * Turns BabelQueue dead-lettering on (opt-in, ADR-0037 decision 2): the URL of the {@code <queue>.dlq} queue
-         * (a FIFO one is {@code <queue>.dlq.fifo}). A poison body is sent to it as the ADR-0035 record, a
-         * version-gated delivery as its raw body, and an unknown URN under the {@code dead_letter} strategy as an
-         * annotated envelope; the source message is deleted only after the send succeeded. Unset (the default): a
-         * poison or version-gated delivery is left to the queue's native {@code RedrivePolicy}. The queue must
+         * Turns BabelQueue dead-lettering on (opt-in, ADR-0037 decision 2): the URL of the {@code <queue>-dlq} queue
+         * (an SQS name cannot contain a dot; a FIFO one is {@code <queue>-dlq.fifo}). A poison body is sent to it as the
+         * ADR-0035 record, a version-gated delivery as its raw body, and an unknown URN under the
+         * {@code dead_letter} strategy as an annotated envelope; the source message is deleted only after the send
+         * succeeded. Unset (the default): a poison or version-gated delivery is left to the queue's native {@code RedrivePolicy}. The queue must
          * exist; this consumer never creates it.
          */
         public Builder deadLetterQueueUrl(String url) {

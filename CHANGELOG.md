@@ -15,7 +15,7 @@ deliveries on their first delivery. The envelope is unchanged (`schema_version` 
 ### Added
 
 - `SqsConsumer.Builder.deadLetterQueueUrl(url)` (opt-in, like the .NET `DeadLetterQueueUrl` and the Node
-  `deadLetterQueueUrl`): the `<queue>.dlq` queue (a FIFO one is `<queue>.dlq.fifo`; the consumer sends it
+  `deadLetterQueueUrl`): the `<queue>-dlq` queue (a FIFO one is `<queue>-dlq.fifo`; the consumer sends it
   the queue name as message group and the SQS message id as deduplication id). "Dead-lettering on" means this
   URL is set. The queue must exist.
 - With a DLQ queue set, the `dead_letter` unknown-URN strategy now writes the envelope, annotated with a
@@ -42,6 +42,10 @@ deliveries on their first delivery. The envelope is unchanged (`schema_version` 
 - Built against `babelqueue-core` 1.13.0 (`PoisonRecord`), unchanged.
 - Vendored the cross-SDK conformance suite v1.8.0 (`version_gate_sqs`, `poison_dlq` runners added) and moved
   the CI pin to it.
+
+### Docs
+
+- The BabelQueue DLQ on SQS is `<queue>-dlq` (FIFO `<queue>-dlq.fifo`), not `<queue>.dlq`: an SQS queue name cannot contain a dot (ADR-0037 decision 7). README and Javadoc only; `deadLetterQueueUrl` is an explicit URL, so no code change.
 
 ## [1.3.0] - 2026-10-24
 

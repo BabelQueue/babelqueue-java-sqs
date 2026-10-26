@@ -72,7 +72,7 @@ delete — observe via `onError` / `onUnknownUrn`. The envelope is unchanged
 Any other value that is not exactly `1` (no trimming — `"2"`, `"x"`, `" 1"`) → the body is **not**
 decoded, the handler is not called, no hook runs, `onError` is notified with a `null` envelope, and the
 message is settled on its **first** delivery (ADR-0037): with a `deadLetterQueueUrl` the body is sent to
-`<queue>.dlq` **exactly as received** (no `dead_letter` block) and deleted after the send succeeded (a failed
+`<queue>-dlq` **exactly as received** (no `dead_letter` block) and deleted after the send succeeded (a failed
 send leaves it for redelivery); under an explicit `delete` strategy it is deleted; without a DLQ queue it is
 left undeleted so SQS redrives it (`RedrivePolicy`). Only an explicitly set `unknownUrnStrategy` is read — an
 `onUnknownUrn` hook never drops a gated message.
@@ -90,7 +90,7 @@ SqsConsumer.builder(sqs, url)
     //.retryBackoff(5).retryBackoffMultiplier(2).retryBackoffMax(300).retryJitter("full")
     .unknownUrnStrategy(UnknownUrnStrategy.RELEASE)   // fail | delete | release | dead_letter
     .unknownUrnReleaseDelaySeconds(60)                // default 0
-    .deadLetterQueueUrl(dlqUrl)                       // opt-in BabelQueue DLQ (<queue>.dlq / <queue>.dlq.fifo)
+    .deadLetterQueueUrl(dlqUrl)                       // opt-in BabelQueue DLQ (<queue>-dlq / <queue>-dlq.fifo)
     .build();
 ```
 
