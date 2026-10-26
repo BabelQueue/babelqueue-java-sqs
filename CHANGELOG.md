@@ -9,6 +9,46 @@ The envelope wire format is versioned separately by `meta.schema_version`
 
 ## [Unreleased]
 
+## [1.4.0] - 2026-10-26
+
+MINOR (ADR-0037): the consumer gains an opt-in BabelQueue DLQ and settles poison bodies and version-gated
+deliveries on their first delivery. The envelope is unchanged (`schema_version` stays `1`).
+
+### Added
+
+- `SqsConsumer.Builder.deadLetterQueueUrl(url)` (opt-in, like the .NET `DeadLetterQueueUrl` and the Node
+  `deadLetterQueueUrl`): the `<queue>-dlq` queue (a FIFO one is `<queue>-dlq.fifo`; the consumer sends it
+  the queue name as message group and the SQS message id as deduplication id). "Dead-lettering on" means this
+  URL is set. The queue must exist.
+- With a DLQ queue set, the `dead_letter` unknown-URN strategy now writes the envelope, annotated with a
+  `dead_letter` block (reason `unknown_urn`), to it and deletes the message only after the send succeeded.
+  Without one it still degrades to `delete`.
+
+### Changed (behaviour)
+
+- **Poison body** (not JSON, not an envelope, no valid identity, or an unsupported `meta.schema_version`):
+  never handed to a handler and never retried. With a DLQ queue it is sent as the ADR-0035 record
+  (`PoisonRecord`, `reason: "poison"`, `original_queue` = this queue) and deleted **only after** the send
+  succeeded; a failed send leaves it unsettled and is reported. Under an explicit `delete` strategy it is
+  deleted. With no DLQ queue nothing changes: it is reported and left to the queue's `RedrivePolicy`.
+- **Version-gated delivery** (`bq-schema-version` present, not blank, not `1`): settled on the first delivery,
+  body never decoded, no handler or hook, no retry. With a DLQ queue the **raw body, byte for byte** (no
+  `dead_letter` block) is sent to it and the message deleted only after the send succeeded (a failed send
+  leaves it unsettled, so the write is retried on redelivery); under an explicit `delete` strategy it is
+  deleted (**dropped**); with no DLQ queue nothing changes (reported, not deleted, native redrive).
+- The poison and version-gate rules read only the **explicitly configured** `unknownUrnStrategy`
+  (`fail` when none is set). An `onUnknownUrn` hook, and the `delete` it implies for an unknown URN, no
+  longer reach them: a hook-only consumer never drops a poison or version-gated delivery silently (owner
+  decision, 2026-10-25: the poison route reads only the explicitly configured strategy, like the version
+  gate). The unknown-URN path is unchanged.
+- Built against `babelqueue-core` 1.13.0 (`PoisonRecord`), unchanged.
+- Vendored the cross-SDK conformance suite v1.8.0 (`version_gate_sqs`, `poison_dlq` runners added) and moved
+  the CI pin to it.
+
+### Docs
+
+- The BabelQueue DLQ on SQS is `<queue>-dlq` (FIFO `<queue>-dlq.fifo`), not `<queue>.dlq`: an SQS queue name cannot contain a dot (ADR-0037 decision 7). README and Javadoc only; `deadLetterQueueUrl` is an explicit URL, so no code change.
+
 ## [1.3.0] - 2026-10-24
 
 ### Added

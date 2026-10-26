@@ -15,7 +15,7 @@ as the PHP/Laravel, Python, Go, Node and .NET SDKs. Implements
 <dependency>
   <groupId>com.babelqueue</groupId>
   <artifactId>babelqueue-sqs</artifactId>
-  <version>1.3.0</version>
+  <version>1.4.0</version>
 </dependency>
 ```
 
@@ -70,8 +70,17 @@ delete — observe via `onError` / `onUnknownUrn`. The envelope is unchanged
 **Schema-version gate (§3.7).** Before decoding the body the consumer reads the
 `bq-schema-version` attribute. Missing or blank (empty / ASCII whitespace only) → normal decode.
 Any other value that is not exactly `1` (no trimming — `"2"`, `"x"`, `" 1"`) → the body is **not**
-decoded, the handler is not called, `onError` is notified with a `null` envelope, and the message is
-left undeleted so SQS redrives it to the DLQ.
+decoded, the handler is not called, no hook runs, `onError` is notified with a `null` envelope, and the
+message is settled on its **first** delivery (ADR-0037): with a `deadLetterQueueUrl` the body is sent to
+`<queue>-dlq` **exactly as received** (no `dead_letter` block) and deleted after the send succeeded (a failed
+send leaves it for redelivery); under an explicit `delete` strategy it is deleted; without a DLQ queue it is
+left undeleted so SQS redrives it (`RedrivePolicy`). Only an explicitly set `unknownUrnStrategy` is read — an
+`onUnknownUrn` hook never drops a gated message.
+
+**Poison bodies (ADR-0037).** A body that is not a valid envelope (not JSON, no identity, unsupported
+`meta.schema_version`) never reaches a handler and is never retried. With a `deadLetterQueueUrl` it is written
+to the DLQ as the ADR-0035 record (`reason: "poison"`; the original body kept, spliced or under `raw`) and
+deleted after the send succeeded; without one it is reported and left to the queue's `RedrivePolicy`.
 
 ```java
 SqsConsumer.builder(sqs, url)
@@ -81,6 +90,7 @@ SqsConsumer.builder(sqs, url)
     //.retryBackoff(5).retryBackoffMultiplier(2).retryBackoffMax(300).retryJitter("full")
     .unknownUrnStrategy(UnknownUrnStrategy.RELEASE)   // fail | delete | release | dead_letter
     .unknownUrnReleaseDelaySeconds(60)                // default 0
+    .deadLetterQueueUrl(dlqUrl)                       // opt-in BabelQueue DLQ (<queue>-dlq / <queue>-dlq.fifo)
     .build();
 ```
 

@@ -1,11 +1,19 @@
 package com.babelqueue.sqs;
 
 import com.babelqueue.BabelQueueException;
+import com.babelqueue.DeadLetters;
 import com.babelqueue.Envelope;
 import com.babelqueue.EnvelopeCodec;
+import com.babelqueue.JsonValues;
+import com.babelqueue.PoisonRecord;
 import com.babelqueue.UnknownUrnException;
 import com.babelqueue.UnknownUrnStrategy;
+import java.nio.charset.StandardCharsets;
+import java.security.MessageDigest;
+import java.security.NoSuchAlgorithmException;
 import java.util.HashMap;
+import java.util.HexFormat;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
@@ -18,6 +26,7 @@ import software.amazon.awssdk.services.sqs.model.DeleteMessageRequest;
 import software.amazon.awssdk.services.sqs.model.Message;
 import software.amazon.awssdk.services.sqs.model.MessageAttributeValue;
 import software.amazon.awssdk.services.sqs.model.ReceiveMessageRequest;
+import software.amazon.awssdk.services.sqs.model.SendMessageRequest;
 
 /**
  * Polls an SQS queue, decodes and validates each message, routes it to the handler
@@ -31,21 +40,36 @@ import software.amazon.awssdk.services.sqs.model.ReceiveMessageRequest;
  * <p>A URN with no handler follows the {@link UnknownUrnStrategy unknown-URN strategy}:
  * {@code fail} reports {@link UnknownUrnException} and leaves the message (visibility expiry
  * redelivers it); {@code delete} deletes it; {@code release} releases it with
- * {@code unknownUrnReleaseDelaySeconds} (default {@code 0}); {@code dead_letter} degrades to {@code delete}
- * because this transport has no DLQ publisher (the contract's "DLQ disabled" rule).
+ * {@code unknownUrnReleaseDelaySeconds} (default {@code 0}); {@code dead_letter} writes the envelope, annotated with
+ * a {@code dead_letter} block (reason {@code unknown_urn}), to the {@link Builder#deadLetterQueueUrl DLQ queue} and
+ * then deletes it, or degrades to {@code delete} when no DLQ queue is configured (the contract's "DLQ disabled" rule).
  * The poll loop never stops on a bad message, a failed release or a failed delete — observe via
- * {@code onError}/{@code onUnknownUrn}. Configure a queue {@code RedrivePolicy} so a poison
- * message, redelivered immediately under the default {@code 0} delay, ends in a native DLQ.
+ * {@code onError}/{@code onUnknownUrn}. Configure a queue {@code RedrivePolicy} so a message left to the broker
+ * (see below), redelivered immediately under the default {@code 0} delay, ends in a native DLQ.
  *
- * <p>Per §3.7 the {@code bq-schema-version} message attribute is checked <b>before</b> the body is
- * decoded: when it is present and is not exactly the schema version the core supports
- * ({@link EnvelopeCodec#SCHEMA_VERSION}, compared exactly as sent, with no trimming — so {@code "2"},
- * {@code "x"}, {@code "01"} and {@code " 1"} are all unknown), the body is never decoded or routed;
- * {@code onError} is notified (with a {@code null} envelope) and the message is neither deleted nor
- * released — the same settle path as a non-conformant envelope, so the queue's redrive policy moves it
- * to the native DLQ. A missing or blank (empty or ASCII-whitespace-only: space, tab, LF, VT, FF, CR)
- * attribute changes nothing, and a {@code "1"} attribute still goes through the post-decode
- * {@link EnvelopeCodec#accepts} check.
+ * <p><b>Poison and version gate (ADR-0037).</b> "Dead-lettering on" means a {@link Builder#deadLetterQueueUrl DLQ
+ * queue URL} is configured (opt-in; a FIFO DLQ is {@code <queue>-dlq.fifo}). Only the <em>explicitly configured</em>
+ * {@link Builder#unknownUrnStrategy strategy} is read by these two rules (none configured means {@code fail}); an
+ * {@code onUnknownUrn} hook, and the {@code delete} it implies for an unknown URN, never affect them.
+ * <ul>
+ *   <li><b>Poison body</b> — not JSON, not an envelope, no valid identity or an unsupported
+ *       {@code meta.schema_version}: never handed to a handler and never retried. {@code delete} deletes it; with a
+ *       DLQ queue the ADR-0035 record ({@link PoisonRecord}, {@code reason: "poison"}) is sent to it and the message
+ *       deleted <em>only after</em> the send succeeded (a failed send leaves it unsettled and is reported); with no
+ *       DLQ queue it is reported and left to the broker's native mechanism (no {@code DeleteMessage}: visibility
+ *       expiry redelivers it and the queue's {@code RedrivePolicy} moves it after {@code maxReceiveCount}).</li>
+ *   <li><b>Version gate</b> (§3.7) — the {@code bq-schema-version} message attribute is checked <b>before</b> the
+ *       body is decoded: when it is present and is not exactly the schema version the core supports
+ *       ({@link EnvelopeCodec#SCHEMA_VERSION}, compared exactly as sent, with no trimming — so {@code "2"},
+ *       {@code "x"}, {@code "01"} and {@code " 1"} are all unknown), the body is never decoded or routed, no handler
+ *       or hook runs, and nothing is retried, on the first delivery, whatever {@code ApproximateReceiveCount} says.
+ *       {@code onError} is notified (with a {@code null} envelope). {@code delete} deletes it; with a DLQ queue the
+ *       body is sent to it <b>exactly as received</b> (no {@code dead_letter} block) and the message deleted only
+ *       after the send succeeded (a failed send leaves it unsettled); with no DLQ queue it is left to the broker's
+ *       native mechanism, as above. A missing or blank (empty or ASCII-whitespace-only: space, tab, LF, VT, FF, CR)
+ *       attribute changes nothing, and a {@code "1"} attribute still goes through the post-decode
+ *       {@link EnvelopeCodec#accepts} check (a body with an unsupported {@code meta.schema_version} is then poison).</li>
+ * </ul>
  */
 public final class SqsConsumer {
 
@@ -81,6 +105,9 @@ public final class SqsConsumer {
     private final ErrorHandler onError;
     private final UnknownUrnHandler onUnknownUrn;
     private final String unknownUrnStrategy;
+    /** The strategy the caller set explicitly, or {@code null}: the only one the poison and version-gate rules read. */
+    private final String configuredStrategy;
+    private final String deadLetterQueueUrl;
     private final double retryBackoffSeconds;
     private final double retryBackoffMultiplier;
     private final double retryBackoffMaxSeconds;
@@ -103,6 +130,8 @@ public final class SqsConsumer {
         this.unknownUrnStrategy = builder.unknownUrnStrategy != null
             ? builder.unknownUrnStrategy
             : (builder.onUnknownUrn != null ? UnknownUrnStrategy.DELETE : UnknownUrnStrategy.FAIL);
+        this.configuredStrategy = builder.unknownUrnStrategy;
+        this.deadLetterQueueUrl = builder.deadLetterQueueUrl;
         this.retryBackoffSeconds = builder.retryBackoffSeconds;
         this.retryBackoffMultiplier = builder.retryBackoffMultiplier;
         this.retryBackoffMaxSeconds = builder.retryBackoffMaxSeconds;
@@ -149,9 +178,7 @@ public final class SqsConsumer {
         String declaredVersion = rawSchemaVersion(message);
         if (declaredVersion != null && !isBlankSchemaVersion(declaredVersion)
             && !declaredVersion.equals(Integer.toString(EnvelopeCodec.SCHEMA_VERSION))) {
-            report(new BabelQueueException("Rejected a BabelQueue message with unsupported "
-                + SCHEMA_VERSION_ATTRIBUTE + " attribute '" + declaredVersion + "' (supported: "
-                + EnvelopeCodec.SCHEMA_VERSION + "); body not decoded."), null, message);
+            settleVersionGated(message, declaredVersion);
             return;
         }
 
@@ -161,8 +188,7 @@ public final class SqsConsumer {
             message.attributesAsStrings().get("ApproximateReceiveCount"));
 
         if (!EnvelopeCodec.accepts(envelope)) {
-            report(new BabelQueueException("Rejected a non-conformant BabelQueue envelope from SQS."),
-                envelope, message);
+            settlePoison(message, body, envelope);
             return;
         }
 
@@ -185,6 +211,127 @@ public final class SqsConsumer {
         // Outside the handler's try: a failed delete is not a handler failure, so it is
         // reported as SqsDeleteException and the message is never released.
         delete(message, envelope);
+    }
+
+    /**
+     * Settles a version-gated delivery on its first delivery (ADR-0037 decision 1, broker-bindings §3.7): never
+     * decoded, no handler or hook, no retry. Reads only the explicitly configured strategy.
+     */
+    private void settleVersionGated(Message message, String declaredVersion) {
+        report(new BabelQueueException("Rejected a BabelQueue message with unsupported "
+            + SCHEMA_VERSION_ATTRIBUTE + " attribute '" + declaredVersion + "' (supported: "
+            + EnvelopeCodec.SCHEMA_VERSION + "); body not decoded."), null, message);
+        if (UnknownUrnStrategy.DELETE.equals(configuredStrategy)) {
+            delete(message, null);
+            return;
+        }
+        if (deadLetterQueueUrl == null) {
+            // Rule 3: nothing to write to. Neither deleted nor released: the broker's native mechanism
+            // (visibility expiry, then the queue's RedrivePolicy) takes it. The SDK does not retry it.
+            return;
+        }
+        // Rule 4: the raw body, byte for byte, then delete. Rule 5: a failed send leaves it unsettled.
+        String body = message.body() == null ? "" : message.body();
+        if (sendToDeadLetterQueue(message, body, message.hasMessageAttributes()
+                ? message.messageAttributes() : Map.of(), null)) {
+            delete(message, null);
+        }
+    }
+
+    /**
+     * Settles a poison body (ADR-0037 decision 2, error-handling.md §7): never handed to a handler, never retried.
+     * Reads only the explicitly configured strategy.
+     */
+    private void settlePoison(Message message, String body, Envelope partial) {
+        BabelQueueException cause = new BabelQueueException("Rejected a non-conformant BabelQueue envelope from SQS.");
+        report(cause, partial, message);
+        if (UnknownUrnStrategy.DELETE.equals(configuredStrategy)) {
+            delete(message, partial);
+            return;
+        }
+        if (deadLetterQueueUrl == null) {
+            // Native: neither deleted nor released (visibility expiry, then the queue's RedrivePolicy).
+            return;
+        }
+        String record;
+        try {
+            record = poisonRecord(body.getBytes(StandardCharsets.UTF_8), SqsQueues.nameFromUrl(queueUrl),
+                receiveAttempts(message), cause);
+        } catch (RuntimeException error) {
+            report(error, partial, message);
+            return;
+        }
+        if (sendToDeadLetterQueue(message, record, message.hasMessageAttributes()
+                ? message.messageAttributes() : Map.of(), partial)) {
+            delete(message, partial);
+        }
+    }
+
+    /**
+     * The ADR-0035 DLQ record of a poison {@code body}: the one builder this consumer writes with (conformance
+     * {@code poison_dlq} drives it directly for bodies SQS itself cannot carry, such as invalid UTF-8).
+     */
+    static String poisonRecord(byte[] body, String originalQueue, int attempts, Throwable cause) {
+        Map<String, Object> block = new LinkedHashMap<>();
+        block.put("reason", "poison");
+        block.put("error", cause.getMessage());
+        block.put("exception", cause.getClass().getName());
+        block.put("failed_at", System.currentTimeMillis());
+        block.put("original_queue", originalQueue);
+        block.put("attempts", attempts);
+        block.put("lang", EnvelopeCodec.SOURCE_LANG);
+        return PoisonRecord.build(body, JsonValues.encode(block));
+    }
+
+    /** {@code ApproximateReceiveCount - 1} (informational {@code dead_letter.attempts}), never negative. */
+    private static int receiveAttempts(Message message) {
+        String receiveCount = message.attributesAsStrings().get("ApproximateReceiveCount");
+        if (receiveCount == null) {
+            return 0;
+        }
+        try {
+            return Math.max(Integer.parseInt(receiveCount.strip()) - 1, 0);
+        } catch (NumberFormatException ex) {
+            return 0;
+        }
+    }
+
+    /**
+     * Sends {@code body} to the DLQ queue; returns {@code false} (after reporting the failure) when the send failed,
+     * so the caller leaves the message unsettled and SQS redelivers it once the visibility timeout expires. A FIFO
+     * DLQ ({@code .fifo}) gets the consumer's queue name as the message group and the SQS message id (else a
+     * digest of the body) as the deduplication id, so a send repeated after a lost delete is not duplicated.
+     */
+    private boolean sendToDeadLetterQueue(
+            Message message, String body, Map<String, MessageAttributeValue> attributes, Envelope envelope) {
+        try {
+            SendMessageRequest.Builder request = SendMessageRequest.builder()
+                .queueUrl(deadLetterQueueUrl)
+                .messageBody(body);
+            if (!attributes.isEmpty()) {
+                request.messageAttributes(attributes);
+            }
+            if (deadLetterQueueUrl.endsWith(".fifo")) {
+                request.messageGroupId(SqsQueues.nameFromUrl(queueUrl));
+                request.messageDeduplicationId(message.messageId() != null && !message.messageId().isEmpty()
+                    ? message.messageId()
+                    : sha256Hex(body));
+            }
+            client.sendMessage(request.build());
+            return true;
+        } catch (RuntimeException sendError) {
+            report(sendError, envelope, message);
+            return false;
+        }
+    }
+
+    private static String sha256Hex(String value) {
+        try {
+            return HexFormat.of().formatHex(
+                MessageDigest.getInstance("SHA-256").digest(value.getBytes(StandardCharsets.UTF_8)));
+        } catch (NoSuchAlgorithmException impossible) {
+            throw new IllegalStateException(impossible);
+        }
     }
 
     /** The {@code bq-schema-version} attribute's string value exactly as sent (no trimming), or {@code null} when absent. */
@@ -216,7 +363,8 @@ public final class SqsConsumer {
             onUnknownUrn.onUnknownUrn(envelope, message);
         }
         switch (unknownUrnStrategy) {
-            case UnknownUrnStrategy.DELETE, UnknownUrnStrategy.DEAD_LETTER -> delete(message, envelope);
+            case UnknownUrnStrategy.DELETE -> delete(message, envelope);
+            case UnknownUrnStrategy.DEAD_LETTER -> deadLetterUnknownUrn(message, envelope);
             case UnknownUrnStrategy.RELEASE -> release(message, unknownUrnReleaseDelaySeconds, envelope);
             default -> {
                 // fail: leave the message; visibility expiry redelivers it, native redrive quarantines it.
@@ -224,6 +372,29 @@ public final class SqsConsumer {
                     report(new UnknownUrnException(urn), envelope, message);
                 }
             }
+        }
+    }
+
+    /**
+     * The {@code dead_letter} unknown-URN strategy: with a DLQ queue the envelope, annotated with a {@code dead_letter}
+     * block (reason {@code unknown_urn}), is sent to it and the message deleted only after the send succeeded (a
+     * failed send leaves it unsettled and is reported); with none it degrades to {@code delete}.
+     */
+    private void deadLetterUnknownUrn(Message message, Envelope envelope) {
+        if (deadLetterQueueUrl == null) {
+            delete(message, envelope);
+            return;
+        }
+        Envelope dead;
+        String body;
+        try {
+            dead = DeadLetters.annotate(envelope, "unknown_urn", SqsQueues.nameFromUrl(queueUrl));
+            body = EnvelopeCodec.encode(dead);
+            if (sendToDeadLetterQueue(message, body, SqsAttributes.project(dead), envelope)) {
+                delete(message, envelope);
+            }
+        } catch (RuntimeException error) {
+            report(error, envelope, message);
         }
     }
 
@@ -342,6 +513,7 @@ public final class SqsConsumer {
         private ErrorHandler onError;
         private UnknownUrnHandler onUnknownUrn;
         private String unknownUrnStrategy;
+        private String deadLetterQueueUrl;
         private double retryBackoffSeconds;
         private double retryBackoffMultiplier = 1.0;
         private double retryBackoffMaxSeconds;
@@ -462,8 +634,9 @@ public final class SqsConsumer {
         /**
          * Unknown-URN strategy: one of {@link UnknownUrnStrategy#FAIL}, {@link UnknownUrnStrategy#DELETE},
          * {@link UnknownUrnStrategy#RELEASE} or {@link UnknownUrnStrategy#DEAD_LETTER} (degrades to
-         * {@code delete}: no DLQ publisher in this transport). Default: {@code fail}, or {@code delete}
-         * when only {@link #onUnknownUrn} is set (pre-1.2.0 behaviour).
+         * {@code delete} when no {@link #deadLetterQueueUrl DLQ queue} is configured). Default: {@code fail}, or
+         * {@code delete} for an unknown URN when only {@link #onUnknownUrn} is set (pre-1.2.0 behaviour; that implied
+         * {@code delete} never reaches the poison and version-gate rules).
          */
         public Builder unknownUrnStrategy(String strategy) {
             Objects.requireNonNull(strategy, "strategy");
@@ -472,6 +645,22 @@ public final class SqsConsumer {
                     UnknownUrnStrategy.RELEASE, UnknownUrnStrategy.DEAD_LETTER -> this.unknownUrnStrategy = strategy;
                 default -> throw new IllegalArgumentException("Unknown unknown-URN strategy: " + strategy);
             }
+            return this;
+        }
+
+        /**
+         * Turns BabelQueue dead-lettering on (opt-in, ADR-0037 decision 2): the URL of the {@code <queue>-dlq} queue
+         * (an SQS name cannot contain a dot; a FIFO one is {@code <queue>-dlq.fifo}). A poison body is sent to it as the
+         * ADR-0035 record, a version-gated delivery as its raw body, and an unknown URN under the
+         * {@code dead_letter} strategy as an annotated envelope; the source message is deleted only after the send
+         * succeeded. Unset (the default): a poison or version-gated delivery is left to the queue's native {@code RedrivePolicy}. The queue must
+         * exist; this consumer never creates it.
+         */
+        public Builder deadLetterQueueUrl(String url) {
+            if (url != null && url.isBlank()) {
+                throw new IllegalArgumentException("deadLetterQueueUrl must not be blank");
+            }
+            this.deadLetterQueueUrl = url;
             return this;
         }
 

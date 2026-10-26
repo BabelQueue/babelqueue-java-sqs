@@ -12,6 +12,7 @@ import software.amazon.awssdk.services.sqs.model.ChangeMessageVisibilityResponse
 import software.amazon.awssdk.services.sqs.model.DeleteMessageRequest;
 import software.amazon.awssdk.services.sqs.model.DeleteMessageResponse;
 import software.amazon.awssdk.services.sqs.model.Message;
+import software.amazon.awssdk.services.sqs.model.MessageAttributeValue;
 import software.amazon.awssdk.services.sqs.model.ReceiveMessageRequest;
 import software.amazon.awssdk.services.sqs.model.ReceiveMessageResponse;
 import software.amazon.awssdk.services.sqs.model.SendMessageRequest;
@@ -28,6 +29,8 @@ final class FakeSqsClient implements SqsClient {
     RuntimeException visibilityError;
     /** When set, only {@code deleteMessage} throws it (a failed acknowledgement). */
     RuntimeException deleteError;
+    /** When set, only {@code sendMessage} throws it (a failed publish or dead-letter write). */
+    RuntimeException sendError;
 
     private final Map<String, Deque<Message>> queues = new HashMap<>();
     private final RuntimeException error;
@@ -55,6 +58,9 @@ final class FakeSqsClient implements SqsClient {
     public SendMessageResponse sendMessage(SendMessageRequest request) {
         if (error != null) {
             throw error;
+        }
+        if (sendError != null) {
+            throw sendError;
         }
         sent.add(request);
         counter++;
@@ -120,6 +126,15 @@ final class FakeSqsClient implements SqsClient {
             message.attributesWithStrings(Map.of("ApproximateReceiveCount", receiveCount));
         }
         push(queueUrl, message.build());
+    }
+
+    /** Seed a message with message attributes and a chosen ApproximateReceiveCount. */
+    void seed(String queueUrl, String body, int receiveCount, Map<String, MessageAttributeValue> attributes) {
+        counter++;
+        push(queueUrl, Message.builder().body(body).receiptHandle("seed-" + counter)
+            .messageAttributes(attributes)
+            .attributesWithStrings(Map.of("ApproximateReceiveCount", String.valueOf(receiveCount)))
+            .build());
     }
 
     private void push(String queueUrl, Message message) {
