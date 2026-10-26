@@ -9,6 +9,8 @@ The envelope wire format is versioned separately by `meta.schema_version`
 
 ## [Unreleased]
 
+## [1.4.0] - 2026-10-26
+
 MINOR (ADR-0037): the consumer gains an opt-in BabelQueue DLQ and settles poison bodies and version-gated
 deliveries on their first delivery. The envelope is unchanged (`schema_version` stays `1`).
 
