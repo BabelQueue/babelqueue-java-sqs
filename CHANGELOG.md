@@ -9,6 +9,12 @@ The envelope wire format is versioned separately by `meta.schema_version`
 
 ## [Unreleased]
 
+## [1.4.1] - 2026-10-26
+
+### Changed
+
+- The poison DLQ block is built by `babelqueue-core` 1.14.0; no wire change. Requires `babelqueue-core` 1.14.0 (was 1.13.0).
+
 ## [1.4.0] - 2026-10-26
 
 MINOR (ADR-0037): the consumer gains an opt-in BabelQueue DLQ and settles poison bodies and version-gated
