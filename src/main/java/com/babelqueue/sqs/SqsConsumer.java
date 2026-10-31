@@ -1,6 +1,8 @@
 package com.babelqueue.sqs;
 
 import com.babelqueue.BabelQueueException;
+import com.babelqueue.DeadLetterEvent;
+import com.babelqueue.DeadLetterObserver;
 import com.babelqueue.DeadLetters;
 import com.babelqueue.Envelope;
 import com.babelqueue.EnvelopeCodec;
@@ -112,6 +114,7 @@ public final class SqsConsumer {
     private final boolean retryJitterFull;
     private final DoubleSupplier random;
     private final int unknownUrnReleaseDelaySeconds;
+    private final DeadLetterObserver deadLetterObserver;
 
     /** The SQS maximum for {@code VisibilityTimeout}: 12 hours, in seconds. */
     public static final int MAX_VISIBILITY_TIMEOUT_SECONDS = 43_200;
@@ -136,6 +139,7 @@ public final class SqsConsumer {
         this.retryJitterFull = builder.retryJitterFull;
         this.random = builder.random != null ? builder.random : () -> ThreadLocalRandom.current().nextDouble();
         this.unknownUrnReleaseDelaySeconds = builder.unknownUrnReleaseDelaySeconds;
+        this.deadLetterObserver = builder.deadLetterObserver;
     }
 
     public static Builder builder(SqsClient client, String queueUrl) {
@@ -231,7 +235,7 @@ public final class SqsConsumer {
         // Rule 4: the raw body, byte for byte, then delete. Rule 5: a failed send leaves it unsettled.
         String body = message.body() == null ? "" : message.body();
         if (sendToDeadLetterQueue(message, body, message.hasMessageAttributes()
-                ? message.messageAttributes() : Map.of(), null)) {
+                ? message.messageAttributes() : Map.of(), null, "", SqsQueues.nameFromUrl(queueUrl))) {
             delete(message, null);
         }
     }
@@ -260,7 +264,7 @@ public final class SqsConsumer {
             return;
         }
         if (sendToDeadLetterQueue(message, record, message.hasMessageAttributes()
-                ? message.messageAttributes() : Map.of(), partial)) {
+                ? message.messageAttributes() : Map.of(), partial, "poison", SqsQueues.nameFromUrl(queueUrl))) {
             delete(message, partial);
         }
     }
@@ -291,9 +295,16 @@ public final class SqsConsumer {
      * so the caller leaves the message unsettled and SQS redelivers it once the visibility timeout expires. A FIFO
      * DLQ ({@code .fifo}) gets the consumer's queue name as the message group and the SQS message id (else a
      * digest of the body) as the deduplication id, so a send repeated after a lost delete is not duplicated.
+     *
+     * <p>After each confirmed send the optional {@link DeadLetterObserver} is called once (ADR-0039 section 5.1) with
+     * {@code reason} ({@code ""} for a raw version-gated body) and {@code eventQueue}; a failed send does not call
+     * it. The observer is isolated through {@link DeadLetterObserver#notifySafely}, so it never changes the settle
+     * outcome. If the later {@code DeleteMessage} fails the message is redelivered and sent again, so the observer
+     * is called again (at-least-once; a FIFO DLQ deduplicates the record but not this call).
      */
     private boolean sendToDeadLetterQueue(
-            Message message, String body, Map<String, MessageAttributeValue> attributes, Envelope envelope) {
+            Message message, String body, Map<String, MessageAttributeValue> attributes, Envelope envelope,
+            String reason, String eventQueue) {
         try {
             SendMessageRequest.Builder request = SendMessageRequest.builder()
                 .queueUrl(deadLetterQueueUrl)
@@ -308,11 +319,28 @@ public final class SqsConsumer {
                     : sha256Hex(body));
             }
             client.sendMessage(request.build());
-            return true;
         } catch (RuntimeException sendError) {
             report(sendError, envelope, message);
             return false;
         }
+        if (deadLetterObserver != null) {
+            DeadLetterObserver.notifySafely(deadLetterObserver, new DeadLetterEvent(
+                eventQueue, SqsQueues.nameFromUrl(deadLetterQueueUrl), reason));
+        }
+        return true;
+    }
+
+    /**
+     * The source queue of a dead-letter event for a decoded, accepted envelope: its {@code meta.queue}, else this
+     * consumer's queue (ADR-0039 section 5.1). A poison or version-gated delivery has no accepted envelope and
+     * always reports the consumer's queue.
+     */
+    private String sourceQueue(Envelope envelope) {
+        if (envelope != null && envelope.meta() != null
+            && envelope.meta().queue() != null && !envelope.meta().queue().isBlank()) {
+            return envelope.meta().queue();
+        }
+        return SqsQueues.nameFromUrl(queueUrl);
     }
 
     private static String sha256Hex(String value) {
@@ -380,7 +408,8 @@ public final class SqsConsumer {
         try {
             dead = DeadLetters.annotate(envelope, "unknown_urn", SqsQueues.nameFromUrl(queueUrl));
             body = EnvelopeCodec.encode(dead);
-            if (sendToDeadLetterQueue(message, body, SqsAttributes.project(dead), envelope)) {
+            if (sendToDeadLetterQueue(message, body, SqsAttributes.project(dead), envelope, "unknown_urn",
+                    sourceQueue(envelope))) {
                 delete(message, envelope);
             }
         } catch (RuntimeException error) {
@@ -510,6 +539,7 @@ public final class SqsConsumer {
         private boolean retryJitterFull;
         private DoubleSupplier random;
         private int unknownUrnReleaseDelaySeconds;
+        private DeadLetterObserver deadLetterObserver;
 
         private Builder(SqsClient client, String queueUrl) {
             this.client = Objects.requireNonNull(client, "client");
@@ -661,6 +691,28 @@ public final class SqsConsumer {
          */
         public Builder unknownUrnReleaseDelaySeconds(int seconds) {
             this.unknownUrnReleaseDelaySeconds = clampDelay(seconds);
+            return this;
+        }
+
+        /**
+         * Optional observer of the dead-letters this consumer itself writes (ADR-0039 section 5.1): called once
+         * per record <b>sent</b> to the {@link #deadLetterQueueUrl DLQ queue} (a version-gated raw body, a poison
+         * body, an unknown URN under {@code dead_letter}), after the send is confirmed and before the source message
+         * is deleted. The event carries the source queue (the envelope's {@code meta.queue}
+         * for an unknown URN, else this consumer's queue name; a poison or version-gated delivery always reports
+         * the consumer's queue), the DLQ queue name and the {@code dead_letter.reason} ({@code ""} for a raw
+         * version-gated body). It is at-least-once: if the later {@code DeleteMessage} fails the message is
+         * redelivered and sent again, and the observer is called again (a FIFO DLQ deduplicates the record, not
+         * the call).
+         *
+         * <p>It is <b>not</b> called when the send fails, when the message is left to the queue's native
+         * {@code RedrivePolicy} (no DLQ queue, or retries exhausted), or when it is deleted instead of dead-lettered.
+         * Anything the observer throws is logged and swallowed; the delete, release and DLQ outcome never change.
+         * Unset (the default): behaviour is unchanged. {@code com.babelqueue.otel.Metrics#deadLetterObserver}
+         * increments {@code babelqueue.dlq.messages}.
+         */
+        public Builder deadLetterObserver(DeadLetterObserver observer) {
+            this.deadLetterObserver = observer;
             return this;
         }
 
