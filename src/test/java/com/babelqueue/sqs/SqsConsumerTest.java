@@ -924,4 +924,25 @@ class SqsConsumerTest {
     private static <T extends Throwable> void sneakyThrow(Throwable t) throws T {
         throw (T) t;
     }
+
+    @Test
+    void eventQueueFallbackTreatsOnlyTheAsciiWhitespaceSetAsBlank() {
+        String json = EnvelopeCodec.encode(
+            EnvelopeCodec.make("urn:babel:orders:created", Map.of("order_id", 7), "billing", null));
+        // meta.queue as JSON text -> the queue the event must report. Only the ASCII whitespace set is blank (ADR-0031):
+        // Unicode spaces and control characters (Character.isWhitespace) are real, non-blank names.
+        String[][] cases = {
+            {" \\t", "orders"}, {"", "orders"}, {"\\u000b\\f\\r", "orders"},
+            {"\\u2003", "\u2003"}, {"\\u00a0", "\u00a0"}, {"\\u001c", "\u001c"}, {"\\u0085", "\u0085"},
+        };
+        for (String[] c : cases) {
+            FakeSqsClient sqs = new FakeSqsClient();
+            sqs.seed(URL, json.replace("\"queue\":\"billing\"", "\"queue\":\"" + c[0] + "\""), 1);
+            List<DeadLetterEvent> events = new ArrayList<>();
+            SqsConsumer.builder(sqs, URL).unknownUrnStrategy(UnknownUrnStrategy.DEAD_LETTER)
+                .deadLetterQueueUrl(DLQ_URL).deadLetterObserver(events::add).build().poll();
+            assertEquals(1, events.size(), c[0]);
+            assertEquals(c[1], events.get(0).queue(), "meta.queue=" + c[0]);
+        }
+    }
 }
