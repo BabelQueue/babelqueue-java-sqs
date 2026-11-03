@@ -9,6 +9,8 @@ The envelope wire format is versioned separately by `meta.schema_version`
 
 ## [Unreleased]
 
+## [1.5.0] - 2026-11-03
+
 ### Added
 
 - `SqsConsumer.Builder.deadLetterObserver(DeadLetterObserver)` (ADR-0039 section 5.1, opt-in): the observer is called
@@ -22,8 +24,7 @@ The envelope wire format is versioned separately by `meta.schema_version`
   native `RedrivePolicy` (no DLQ queue, or retries exhausted - the SDK does not dead-letter those), or for a
   `delete`/degraded drop. An observer that throws is logged and swallowed; the delete, release and DLQ outcome are
   unchanged. Unset (the default) behaviour is byte-for-byte unchanged. Wire format unchanged.
-- Requires a `babelqueue-core` that carries `DeadLetterObserver` / `DeadLetterEvent` (the core release after 1.14.0);
-  the dependency pin moves with that release.
+- Requires a `babelqueue-core` that carries `DeadLetterObserver` / `DeadLetterEvent` (core 1.15.0, the version this release pins).
 
 ## [1.4.1] - 2026-10-26
 
