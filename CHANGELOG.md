@@ -9,6 +9,23 @@ The envelope wire format is versioned separately by `meta.schema_version`
 
 ## [Unreleased]
 
+## [1.5.0] - 2026-11-03
+
+### Added
+
+- `SqsConsumer.Builder.deadLetterObserver(DeadLetterObserver)` (ADR-0039 section 5.1, opt-in): the observer is called
+  once for every record this consumer **sends** to the configured `deadLetterQueueUrl` - a version-gated raw
+  body (empty `reason`), a poison body (`poison`) and an unknown URN under `dead_letter` (`unknown_urn`) - after the
+  send is confirmed and before the source message is deleted. The event carries the source queue (the
+  envelope's `meta.queue` for an unknown URN, else the consumer's queue name; a poison or version-gated delivery
+  always reports the consumer's queue), the DLQ queue name and the `dead_letter.reason`. The call is at-least-once:
+  if the later `DeleteMessage` fails, the message is redelivered and sent again, and the observer is called again
+  (a FIFO DLQ deduplicates the record, not the call). It is not called for a failed send, for a message left to the queue's
+  native `RedrivePolicy` (no DLQ queue, or retries exhausted - the SDK does not dead-letter those), or for a
+  `delete`/degraded drop. An observer that throws is logged and swallowed; the delete, release and DLQ outcome are
+  unchanged. Unset (the default) behaviour is byte-for-byte unchanged. Wire format unchanged.
+- Requires a `babelqueue-core` that carries `DeadLetterObserver` / `DeadLetterEvent` (core 1.15.0, the version this release pins).
+
 ## [1.4.1] - 2026-10-26
 
 ### Changed
